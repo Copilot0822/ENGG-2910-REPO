@@ -3,7 +3,18 @@ name = "engg-2910-repo"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
+authors = [
+    { name = "Copilot0822", email = "123857131+Copilot0822@users.noreply.github.com" }
+]
 requires-python = ">=3.14"
 dependencies = [
     "numpy>=2.5.3",
+    "sympy>=1.14.0",
 ]
+
+[project.scripts]
+engg-2910-repo = "engg_2910_repo:main"
+
+[build-system]
+requires = ["uv_build>=0.12.15,<0.13.0"]
+build-backend = "uv_build"
