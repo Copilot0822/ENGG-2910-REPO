@@ -1,0 +1,27 @@
+[project]
+name = "simulator"
+version = "0.1.0"
+description = "Synthetic NMEA 2000 datasets and linear CAN signal inference experiments"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.3",
+]
+
+[project.scripts]
+n2k-simulator = "simulator.cli:main"
+n2k-inference = "inference.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.15,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
