@@ -232,6 +232,90 @@ the deterministic 25-target aligned subsets, NMEA 2000 Top-1/Top-5 accuracy was
 subsets, not claims about equal database-wide difficulty; the full J1939 result
 above covers all 5,493 baseline targets.
 
+## Complete J1939 library experiment
+
+The full-library command generates 200 observations for every signal in all
+2,043 PGNs, including BAM and RTS/CTS payloads, then runs an aligned baseline
+and a generic full search:
+
+```powershell
+uv run python -m inference full-library --output data/j1939/full_library --observations-per-signal 200 --seed 42 --batch-size 250 --candidate-batch-size 512 --resume
+```
+
+Checkpoints are written after each deterministic target batch. `--resume`
+validates the saved configuration and skips completed batches. Evaluation and
+plots can be regenerated without rerunning simulation or discovery:
+
+```powershell
+uv run python -m inference full-library --output data/j1939/full_library --evaluation-only
+```
+
+The reconciled population is:
+
+| Population | Signals |
+| --- | ---: |
+| Aligned 8/16/32 | 6,930 |
+| Additional non-aligned or other-width signals through 32 bits | 6,788 |
+| Larger 40/56/64-bit signals | 56 |
+| Unsupported | 0 |
+| Total | 13,774 |
+
+The generic policy is fixed independently of ground truth: every width from 1
+through 32 bits plus 40, 48, 56, and 64 bits, at every possible start bit. The
+dataset contains 408,600 logical messages, 547,600 physical frames, and
+2,754,800 synchronized target observations.
+
+Measured category results are:
+
+| Category/search | Signals | Top-1 | Top-3 | Top-5 | Top-10 | Raw full | Identifiable full |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| A: aligned baseline | 6,930 | 99.9278% | 99.9711% | 100% | 100% | 98.2107% | 98.2828% |
+| B: extended, at most 32 bits | 13,718 | 98.6587% | 99.4460% | 99.4679% | 99.5626% | 97.8787% | 98.8118% |
+| C: 40/56/64-bit | 56 | 0% | 0% | 0% | 0% | 0% | 92.8571% |
+| D: complete inferable library | 13,774 | 98.2576% | 99.0417% | 99.0635% | 99.1578% | 97.4808% | 98.7876% |
+
+The 56 large fields deliberately expose identifiability rather than transport
+failure. Their valid raw intervals leave most declared upper bits permanently
+zero, so shorter fields at the same start reproduce the physical values exactly.
+The conservative ambiguity rule classifies 52 as equivalent and leaves four as
+incorrect because their best exact fit crosses a neighboring field boundary.
+
+For the complete generic run, best-candidate component accuracy was 100% PGN,
+99.6515% start bit, 98.2576% declared width, 100% byte order, and 99.9419%
+signedness. Mean absolute factor and offset errors across all best candidates
+were 0.07568 and 0.10943. The final classifications were 13,427
+`IDENTIFIABLE`, 180 `AMBIGUOUS`, and 167 `INCORRECT`.
+
+Ambiguity uses the complete effective raw interval, calculated from the
+intersection of declared raw and physical ranges. Signedness is ambiguous only
+when the whole interval lies below the sign bit. Width is ambiguous only when
+upper bits remain zero across the whole interval and a shorter candidate at the
+same PGN/start has the same byte order, factor, and offset. This is stricter than
+calling two candidates ambiguous merely because they happened to agree in the
+200 generated samples.
+
+Transport and alignment results under the generic full search were:
+
+| Group | Signals | Top-1 | Identifiable full |
+| --- | ---: | ---: | ---: |
+| Byte-aligned 8/16/32 | 6,930 | 97.4315% | 97.6623% |
+| Non-aligned or other width | 6,844 | 99.0941% | 99.9269% |
+| Single-frame | 12,165 | 98.8492% | 99.7863% |
+| BAM | 1,575 | 93.7143% | 91.1111% |
+| RTS/CTS | 34 | 97.0588% | 97.0588% |
+
+The aligned pass extracted 143,344 candidate definitions and evaluated 967,480
+regressions in 19.54 seconds. The complete search extracted 9,465,786 reusable
+candidate definitions and evaluated 89,775,236 regressions in 83.07 seconds:
+27.13 seconds extracting candidate matrices, 32.40 seconds fitting/ranking, and
+13.60 seconds loading inputs. Peak candidate-matrix size was 2.44 MiB. Complete
+simulation, both searches, evaluation, serialization, and plotting took 142.76
+seconds.
+
+Detailed per-signal results, accuracy-by-width/alignment/transport tables,
+search-space measurements, and five summary plots are under
+`data/j1939/full_library/`.
+
 ## Output schemas
 
 `data/j1939/simulated/can_frames.csv` uses:

@@ -93,8 +93,19 @@ def write_j1939_outputs(
                 "scale": _number(signal.factor),
                 "factor": _number(signal.factor),
                 "offset": _number(signal.offset),
+                "minimum": _number(signal.minimum),
+                "maximum": _number(signal.maximum),
+                "raw_min": signal.raw_min,
+                "raw_max": signal.raw_max,
                 "unit": signal.unit,
                 "logical_message_length": message.length_bytes,
+                "transport_category": (
+                    "single_frame"
+                    if not message.requires_transport
+                    else "RTS_CTS"
+                    if message.pdu_type == "PDU1"
+                    else "BAM"
+                ),
                 "source_database": database.path.name,
                 "is_linear_target": signal.is_linear,
                 "aligned_8_16_32": signal.aligned_8_16_32,

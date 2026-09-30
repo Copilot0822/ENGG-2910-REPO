@@ -113,6 +113,32 @@ def build_parser() -> argparse.ArgumentParser:
     comparison_parser.add_argument("--min-pairs", type=int, default=8)
     comparison_parser.add_argument("--min-pairing-fraction", type=float, default=0.5)
     comparison_parser.add_argument("--top-k", type=int, default=10)
+
+    full_parser = subparsers.add_parser(
+        "full-library",
+        help="run the complete 13,774-signal J1939 experiment",
+    )
+    full_parser.add_argument(
+        "--database",
+        type=Path,
+        default=PROJECT_ROOT / "vendor" / "j1939" / "J1939_2024-06_v2.4.json",
+    )
+    full_parser.add_argument(
+        "--output",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "j1939" / "full_library",
+    )
+    full_parser.add_argument("--observations-per-signal", type=int, default=200)
+    full_parser.add_argument("--seed", type=int, default=42)
+    full_parser.add_argument("--batch-size", type=int, default=250)
+    full_parser.add_argument("--candidate-batch-size", type=int, default=512)
+    full_parser.add_argument("--top-k", type=int, default=10)
+    full_parser.add_argument("--resume", action="store_true")
+    full_parser.add_argument(
+        "--evaluation-only",
+        action="store_true",
+        help="refresh evaluation and plots from completed inference outputs",
+    )
     return parser
 
 
@@ -169,6 +195,27 @@ def main(argv: list[str] | None = None) -> None:
             top_k=arguments.top_k,
         )
         print(json.dumps(rows, indent=2))
+        return
+    if arguments.command == "full-library":
+        from simulator.j1939.full_library import (
+            refresh_full_library_evaluation,
+            run_full_library_experiment,
+        )
+
+        if arguments.evaluation_only:
+            summary = refresh_full_library_evaluation(arguments.output)
+        else:
+            summary = run_full_library_experiment(
+                database_path=arguments.database,
+                output_directory=arguments.output,
+                observations_per_signal=arguments.observations_per_signal,
+                seed=arguments.seed,
+                batch_size=arguments.batch_size,
+                candidate_batch_size=arguments.candidate_batch_size,
+                top_k=arguments.top_k,
+                resume=arguments.resume,
+            )
+        print(json.dumps(summary, indent=2))
         return
     if arguments.protocol == "j1939":
         from simulator.j1939.experiments import run_j1939_experiment
