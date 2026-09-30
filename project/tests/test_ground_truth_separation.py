@@ -18,3 +18,5 @@ def test_discovery_module_has_no_simulator_or_answer_key_dependency():
     assert "ground_truth.json" not in source
     assert "signal_catalog.csv" not in source
     assert "canboat.json" not in source
+    assert "J1939_2024" not in source
+    assert "ground_truth" not in source

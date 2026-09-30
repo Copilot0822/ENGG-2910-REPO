@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Literal
 
 
-InferenceMode = Literal["aligned", "arbitrary"]
+InferenceMode = Literal["aligned", "arbitrary", "extended"]
 ByteOrder = Literal["little_endian", "big_endian"]
 
 
@@ -102,8 +102,13 @@ def generate_specs(
     specs: list[CandidateSpec] = []
     for bit_length in bit_lengths:
         for start_bit in candidate_starts(payload_length * 8, bit_length, mode):
+            # A byte-order alternative is distinct only for whole-byte fields.
+            # DBC-style sub-byte candidates use the CAN payload's LSB-first bit
+            # numbering and therefore have one extraction order.
             orders: tuple[ByteOrder, ...] = (
-                ("little_endian",) if bit_length == 8 else byte_orders
+                ("little_endian",)
+                if bit_length == 8 or bit_length % 8
+                else byte_orders
             )
             for byte_order in orders:
                 for signed in (False, True):
@@ -119,4 +124,3 @@ def generate_specs(
                         )
                     )
     return tuple(specs)
-

@@ -1,4 +1,5 @@
 from inference.candidate import extract_raw
+from inference.candidate import generate_specs
 
 
 def test_aligned_8_16_and_32_bit_extraction():
@@ -18,3 +19,18 @@ def test_signed_and_arbitrary_bit_extraction():
             payload[absolute // 8] |= 1 << (absolute % 8)
     assert extract_raw(bytes(payload), 5, 12, signed=True, byte_order="little_endian") == -321
 
+
+def test_extended_non_byte_lengths_do_not_create_invalid_big_endian_candidates():
+    specs = generate_specs(
+        0xFEEE,
+        1,
+        8,
+        "extended",
+        (1, 5, 12, 16),
+        ("little_endian", "big_endian"),
+    )
+    assert specs
+    assert all(
+        spec.byte_order == "little_endian" or spec.bit_length % 8 == 0
+        for spec in specs
+    )

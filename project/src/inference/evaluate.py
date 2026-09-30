@@ -83,6 +83,8 @@ def evaluate_results(
                 located_offset_absolute_errors.append(offset_abs)
             full_match = (
                 _location_matches(best, truth)
+                and str(best.get("byte_order", "little_endian"))
+                == str(truth.get("byte_order", "little_endian"))
                 and bool(best["signed"]) == bool(truth["signed"])
                 and math.isclose(
                     actual_scale,

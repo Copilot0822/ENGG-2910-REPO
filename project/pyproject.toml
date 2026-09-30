@@ -1,7 +1,7 @@
 [project]
 name = "simulator"
 version = "0.1.0"
-description = "Synthetic NMEA 2000 datasets and linear CAN signal inference experiments"
+description = "Synthetic NMEA 2000/J1939 datasets and linear CAN signal inference experiments"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

@@ -107,12 +107,13 @@ def infer_signals(
     top_k: int = 10,
     max_signals: int | None = None,
     selected_signals: set[str] | None = None,
+    protocol: str = "nmea2000",
 ) -> InferenceRun:
     """Infer signal locations without reading simulator or answer-key files."""
 
     started = time.perf_counter()
-    if mode not in {"aligned", "arbitrary"}:
-        raise ValueError("mode must be 'aligned' or 'arbitrary'")
+    if mode not in {"aligned", "arbitrary", "extended"}:
+        raise ValueError("mode must be aligned, arbitrary, or extended")
     if min_pairs < 3 or top_k <= 0:
         raise ValueError("min_pairs must be at least 3 and top_k must be positive")
     if not 0 <= min_pairing_fraction <= 1:
@@ -120,7 +121,7 @@ def infer_signals(
     if not bit_lengths or any(length <= 0 for length in bit_lengths):
         raise ValueError("bit lengths must be positive")
 
-    messages = load_logical_messages(can_path)
+    messages = load_logical_messages(can_path, protocol)
     known_values = load_known_values(known_path)
     streams = _build_streams(messages)
     grouped_known = _group_known(known_values)
@@ -237,6 +238,7 @@ def infer_signals(
         "can_input": str(can_path),
         "known_values_input": str(known_path),
         "inference_mode": mode,
+        "protocol": protocol,
         "supported_bit_lengths": list(bit_lengths),
         "byte_orders": list(byte_orders),
         "minimum_pairs": min_pairs,

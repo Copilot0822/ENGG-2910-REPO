@@ -14,6 +14,7 @@ from inference.fast_packet import (
     looks_like_single_frame_fast_packet,
     reassemble_physical_frames,
 )
+from inference.j1939_tp import is_transport_group, reassemble_j1939_tp
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +39,7 @@ class LogicalMessage:
     priority: int
     payload: bytes
     is_fast_packet: bool
+    transport: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,7 +53,7 @@ class KnownValue:
     unit: str
 
 
-_SIGNAL_ID = re.compile(r"\[(signal_\d+)\]\s*$")
+_SIGNAL_ID = re.compile(r"\[((?:j1939_)?signal_\d+)\]\s*$")
 
 
 def _require_columns(reader: csv.DictReader, required: set[str], path: Path) -> None:
@@ -91,7 +93,11 @@ def load_physical_frames(path: str | Path) -> list[PhysicalFrame]:
     return frames
 
 
-def reconstruct_logical_messages(frames: list[PhysicalFrame]) -> list[LogicalMessage]:
+def reconstruct_logical_messages(
+    frames: list[PhysicalFrame], protocol: str = "nmea2000"
+) -> list[LogicalMessage]:
+    if protocol not in {"nmea2000", "j1939", "auto"}:
+        raise ValueError("protocol must be nmea2000, j1939, or auto")
     grouped: dict[int, list[PhysicalFrame]] = defaultdict(list)
     for frame in frames:
         grouped[frame.message_id].append(frame)
@@ -101,20 +107,42 @@ def reconstruct_logical_messages(frames: list[PhysicalFrame]) -> list[LogicalMes
         first = ordered[0]
         if [frame.frame_index for frame in ordered] != list(range(len(ordered))):
             raise ValueError(f"message {message_id} has non-contiguous frame indexes")
-        if any(
-            frame.sample_id != first.sample_id or frame.can_id != first.can_id
-            for frame in ordered
-        ):
-            raise ValueError(f"message {message_id} changes sample or CAN identifier")
-        if len(ordered) > 1:
+        if any(frame.sample_id != first.sample_id for frame in ordered):
+            raise ValueError(f"message {message_id} changes sample")
+        if protocol in {"j1939", "auto"} and is_transport_group(ordered):
+            reconstructed = reassemble_j1939_tp(ordered)
+            messages.append(
+                LogicalMessage(
+                    sample_id=first.sample_id,
+                    timestamp=first.timestamp,
+                    message_id=message_id,
+                    can_id=first.can_id,
+                    pgn=reconstructed.pgn,
+                    source=reconstructed.source,
+                    destination=reconstructed.destination,
+                    priority=parse_can_id(first.can_id).priority,
+                    payload=reconstructed.payload,
+                    is_fast_packet=False,
+                    transport="j1939_tp",
+                )
+            )
+            continue
+        if any(frame.can_id != first.can_id for frame in ordered):
+            raise ValueError(f"message {message_id} changes CAN identifier outside J1939 TP")
+        if len(ordered) > 1 and protocol != "j1939":
             payload = reassemble_physical_frames([frame.data for frame in ordered])
             is_fast = True
-        elif looks_like_single_frame_fast_packet(first.data):
+            transport = "nmea2000_fast_packet"
+        elif protocol != "j1939" and looks_like_single_frame_fast_packet(first.data):
             payload = first.data[2 : 2 + first.data[1]]
             is_fast = True
+            transport = "nmea2000_fast_packet"
         else:
+            if len(ordered) > 1:
+                raise ValueError(f"unrecognized multi-frame J1939 message {message_id}")
             payload = first.data
             is_fast = False
+            transport = "single_frame"
         parsed = parse_can_id(first.can_id)
         messages.append(
             LogicalMessage(
@@ -128,13 +156,16 @@ def reconstruct_logical_messages(frames: list[PhysicalFrame]) -> list[LogicalMes
                 priority=parsed.priority,
                 payload=payload,
                 is_fast_packet=is_fast,
+                transport=transport,
             )
         )
     return sorted(messages, key=lambda item: (item.sample_id, item.message_id))
 
 
-def load_logical_messages(path: str | Path) -> list[LogicalMessage]:
-    return reconstruct_logical_messages(load_physical_frames(path))
+def load_logical_messages(
+    path: str | Path, protocol: str = "nmea2000"
+) -> list[LogicalMessage]:
+    return reconstruct_logical_messages(load_physical_frames(path), protocol)
 
 
 def load_known_values(path: str | Path) -> list[KnownValue]:
@@ -169,4 +200,3 @@ def load_known_values(path: str | Path) -> list[KnownValue]:
                     f"invalid known-value row {line_number} in {source}: {exc}"
                 ) from exc
     return values
-
