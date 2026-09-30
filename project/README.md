@@ -212,6 +212,15 @@ Top-5, and full-encoding plots. The measured 25-target aligned results were:
 | 50 | 100% | 100% | 88% | 1,600 | 10.75 s |
 | 100 | 100% | 100% | 88% | 1,600 | 13.18 s |
 | 200 | 100% | 100% | 92% | 1,600 | 19.08 s |
+| 10,000 | 100% | 100% | 92% | 1,600 | 61.99 s |
+
+The 10,000-observation run used the same deterministic 25-target selection but
+generated only its 13 required PGNs on disjoint sample ranges. This avoids a
+needless 50-times expansion of the complete 5,493-target baseline while keeping
+the inference inputs and 1,600-candidate search unchanged. Its two remaining
+full-encoding misses had correct locations, byte order, factor, and offset; only
+signedness was observationally ambiguous because neither 8-bit unsigned target
+entered the sign-bit region.
 
 ## NMEA 2000 versus J1939
 

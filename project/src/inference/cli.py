@@ -87,6 +87,11 @@ def build_parser() -> argparse.ArgumentParser:
     experiment_parser.add_argument(
         "--protocol", choices=("nmea2000", "j1939"), default="nmea2000"
     )
+    experiment_parser.add_argument(
+        "--skip-cross-protocol",
+        action="store_true",
+        help="do not rewrite the NMEA 2000 versus J1939 comparison CSV",
+    )
 
     comparison_parser = subparsers.add_parser(
         "compare-search",
@@ -181,8 +186,19 @@ def main(argv: list[str] | None = None) -> None:
             min_pairing_fraction=arguments.min_pairing_fraction,
             top_k=arguments.top_k,
             messages_per_sample=arguments.messages_per_sample,
-            n2k_results_path=PROJECT_ROOT / "data" / "experiments" / "recovery_vs_observations.csv",
-            cross_protocol_output=PROJECT_ROOT / "data" / "experiments" / "n2k_vs_j1939.csv",
+            n2k_results_path=(
+                None
+                if arguments.skip_cross_protocol
+                else PROJECT_ROOT
+                / "data"
+                / "experiments"
+                / "recovery_vs_observations.csv"
+            ),
+            cross_protocol_output=(
+                None
+                if arguments.skip_cross_protocol
+                else PROJECT_ROOT / "data" / "experiments" / "n2k_vs_j1939.csv"
+            ),
         )
         print(json.dumps(rows, indent=2))
         return

@@ -19,6 +19,7 @@ from inference.infer import infer_signals
 from inference.output import write_inference_outputs
 from simulator.j1939.generator import J1939DatasetGenerator
 from simulator.j1939.loader import load_j1939_database
+from simulator.j1939.models import J1939Database, J1939Message
 from simulator.j1939.output import write_j1939_outputs
 
 
@@ -190,10 +191,26 @@ def run_j1939_search_space_comparison(
     return rows
 
 
-def _select_signals(known_path: Path, limit: int) -> set[str]:
-    with known_path.open(newline="", encoding="utf-8") as handle:
-        names = sorted({row["signal_name"] for row in csv.DictReader(handle)})
-    return set(names[:limit])
+def _select_aligned_population(
+    database: J1939Database, limit: int
+) -> tuple[set[str], list[J1939Message]]:
+    eligible = sorted(
+        (
+            f"{signal.name} [{signal.signal_id}]",
+            message.definition_id,
+        )
+        for message in database.single_frame_messages
+        for signal in message.target_signals("aligned_8_16_32")
+    )
+    selected = eligible[:limit]
+    selected_names = {name for name, _ in selected}
+    definition_ids = {definition_id for _, definition_id in selected}
+    definitions = [
+        message
+        for message in database.messages
+        if message.definition_id in definition_ids
+    ]
+    return selected_names, definitions
 
 
 def _cross_protocol_rows(
@@ -280,18 +297,20 @@ def run_j1939_experiment(
     output = Path(output_directory)
     output.mkdir(parents=True, exist_ok=True)
     database = load_j1939_database(database_path)
-    simulation = J1939DatasetGenerator(database, seed).coverage_mode(
+    selected_signals, selected_messages = _select_aligned_population(
+        database, max_signals
+    )
+    simulation = J1939DatasetGenerator(database, seed).targeted_coverage_mode(
         max(counts),
+        selected_messages,
         category="aligned_8_16_32",
         include_transport=False,
-        messages_per_sample=messages_per_sample,
     )
     dataset = output / "dataset"
     write_j1939_outputs(dataset, database, simulation)
     can_path = dataset / "can_frames.csv"
     full_known = dataset / "known_values.csv"
     truth_path = dataset / "ground_truth.json"
-    selected_signals = _select_signals(full_known, max_signals)
     rows: list[dict[str, object]] = []
     for count in counts:
         known_subset = output / f"known_values_{count}.csv"
@@ -359,7 +378,10 @@ def run_j1939_experiment(
         "min_pairs": min_pairs,
         "min_pairing_fraction": min_pairing_fraction,
         "top_k": top_k,
-        "messages_per_sample": messages_per_sample,
+        "messages_per_sample": 1,
+        "requested_messages_per_sample": messages_per_sample,
+        "selected_message_count": len(selected_messages),
+        "generation_strategy": "targeted messages on disjoint sample ranges",
         "database_version": database.database_version,
         "json_sha256": database.json_sha256,
         "single_frame_baseline": True,

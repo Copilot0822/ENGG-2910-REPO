@@ -223,6 +223,49 @@ class J1939DatasetGenerator:
         result.time_step_count = sample_id
         return result
 
+    def targeted_coverage_mode(
+        self,
+        minimum: int,
+        definitions: list[J1939Message],
+        *,
+        category: TargetCategory,
+        include_transport: bool,
+    ) -> J1939SimulationResult:
+        """Cover selected messages on disjoint sample ranges.
+
+        Disjoint ranges preserve the normal inference experiment's pairing
+        behavior: a signal is synchronized with its own message stream without
+        making every selected PGN appear spuriously synchronized with it.  This
+        is substantially smaller than generating the entire database for very
+        high observation counts.
+        """
+
+        if minimum <= 0 or not definitions:
+            raise ValueError("minimum and definitions must be nonempty")
+        if not include_transport and any(
+            definition.requires_transport for definition in definitions
+        ):
+            raise ValueError("selected definitions require J1939 TP")
+        result = J1939SimulationResult(
+            options={
+                "protocol": "j1939",
+                "mode": "targeted_coverage",
+                "min_observations_per_field": minimum,
+                "category": category,
+                "include_transport": include_transport,
+                "messages_per_sample": 1,
+                "selected_message_count": len(definitions),
+                "seed": self.seed,
+            }
+        )
+        sample_id = 0
+        for definition in definitions:
+            for _ in range(minimum):
+                self._emit_sample(result, sample_id, [definition], category)
+                sample_id += 1
+        result.time_step_count = sample_id
+        return result
+
     def _emit_sample(
         self,
         result: J1939SimulationResult,

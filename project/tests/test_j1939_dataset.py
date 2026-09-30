@@ -52,3 +52,21 @@ def test_all_linear_definitions_generate_with_transport(j1939_database):
     assert result.logical_message_count == 2043
     assert len(result.frames) > result.logical_message_count
     assert all(len(frame.data) <= 8 for frame in result.frames)
+
+
+def test_targeted_coverage_uses_disjoint_sample_ranges(j1939_database):
+    definitions = [
+        message
+        for message in j1939_database.single_frame_messages
+        if message.target_signals("aligned_8_16_32")
+    ][:2]
+    result = J1939DatasetGenerator(j1939_database, 29).targeted_coverage_mode(
+        3,
+        definitions,
+        category="aligned_8_16_32",
+        include_transport=False,
+    )
+    assert result.time_step_count == 6
+    assert result.logical_message_count == 6
+    assert {frame.sample_id for frame in result.frames[:3]} == {0, 1, 2}
+    assert {frame.sample_id for frame in result.frames[3:]} == {3, 4, 5}
