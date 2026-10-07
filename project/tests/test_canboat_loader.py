@@ -1,4 +1,5 @@
 import json
+from hashlib import sha256
 
 from conftest import DATABASE_PATH
 from simulator.models import SupportStatus
@@ -12,7 +13,8 @@ def test_database_loads_and_reports_versions_from_file(database):
     assert len({item.variant_id for item in database.definitions}) == len(
         database.definitions
     )
-    assert database.sha256 == "8cae9f0b6288dbfba377ba45bdbfd572242e8850f090b1a2ebd103f739e507fd"
+    # Git may check out this JSON with LF or CRLF on different systems.
+    assert database.sha256 == sha256(DATABASE_PATH.read_bytes()).hexdigest()
 
 
 def test_loader_classifies_every_definition(database):
