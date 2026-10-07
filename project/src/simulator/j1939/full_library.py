@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from inference.full_library import infer_full_library
+from inference.output_privacy import protect_private_outputs
 from inference.full_library_evaluate import (
     _effective_raw_bounds,
     evaluate_full_library,
@@ -136,6 +137,11 @@ def _write_breakdown(
             )
 
 
+def _public_accounting(accounting: dict[str, Any]) -> dict[str, Any]:
+    """Retain aggregate counts without original database ID lists."""
+    return {key: value for key, value in accounting.items() if key != "unsupported_signal_ids"}
+
+
 def _write_search_analysis(path: Path, rows: list[dict[str, Any]]) -> None:
     columns = [
         "mode",
@@ -179,6 +185,9 @@ def run_full_library_experiment(
         directory.mkdir(parents=True, exist_ok=True)
 
     database = load_j1939_database(database_path)
+    protect_private_outputs(output, private_derived_output=database.private_derived_output)
+    # Install guards before the resume branch, which may skip the output writer.
+    protect_private_outputs(simulated, private_derived_output=database.private_derived_output)
     accounting = _accounting(database)
     print(f"Total J1939 signals: {accounting['total_j1939_signals']}", flush=True)
     print(
@@ -201,7 +210,7 @@ def run_full_library_experiment(
         flush=True,
     )
     (metadata_directory / "full_library_accounting.json").write_text(
-        json.dumps(accounting, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(_public_accounting(accounting), indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 
     simulation_started = time.perf_counter()
@@ -216,7 +225,10 @@ def run_full_library_experiment(
         if resume and all(path.exists() for path in required_dataset)
         else {}
     )
-    if existing_metadata.get("output_schema_version") == 2:
+    if (
+        existing_metadata.get("output_schema_version") == 3
+        and existing_metadata.get("private_derived_output") == database.private_derived_output
+    ):
         simulation_metadata = json.loads(
             (simulated / "simulation_metadata.json").read_text(encoding="utf-8")
         )
@@ -382,7 +394,7 @@ def run_full_library_experiment(
     write_full_library_plots(full_evaluation, evaluation_directory, search_rows)
 
     summary = {
-        "accounting": accounting,
+        "accounting": _public_accounting(accounting),
         "dataset": simulation_metadata,
         "categories": categories,
         "by_alignment": full_evaluation["by_alignment"],
@@ -432,6 +444,9 @@ def refresh_full_library_evaluation(
     metadata_directory = output / "metadata"
     summary_path = output / "full_library_summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    private_derived_output = summary.get("dataset", {}).get("private_derived_output") is not False
+    protect_private_outputs(output, private_derived_output=private_derived_output)
+    protect_private_outputs(simulated, private_derived_output=private_derived_output)
     truth = json.loads((simulated / "ground_truth.json").read_text(encoding="utf-8"))[
         "signals"
     ]
@@ -444,7 +459,6 @@ def refresh_full_library_evaluation(
             - len(unsupported_ids),
             "category_d_all_inferable": len(truth) - len(unsupported_ids),
             "unsupported_for_inference": len(unsupported_ids),
-            "unsupported_signal_ids": sorted(unsupported_ids),
             "unsupported_reason": (
                 "Raw integer range exceeds exact IEEE-754 float64 "
                 "representation or width is absent from the generic candidate policy."
@@ -452,6 +466,7 @@ def refresh_full_library_evaluation(
         }
     )
     summary["accounting"].pop("category_c_larger_than_32", None)
+    summary["accounting"].pop("unsupported_signal_ids", None)
     summary["accounting"]["partition_reconciliation"].update(
         {
             "larger_than_32_inferable": larger_total - len(unsupported_ids),

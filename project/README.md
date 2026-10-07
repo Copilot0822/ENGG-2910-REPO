@@ -370,7 +370,7 @@ sample_id,timestamp,message_id,frame_index,can_id,data_hex
 ```
 
 `can_id` is the raw 29-bit identifier. `data_hex` contains at most eight bytes.
-There are no decoded PGNs or signal definitions in this file.
+This file remains private when generated from licensed J1939 definitions.
 
 `data/j1939/simulated/known_values.csv` uses:
 
@@ -385,12 +385,21 @@ in the private local ground truth and catalog.
 
 ## Generated data and public results
 
-Licensed-derived answer keys, catalogs, inferred encodings, candidate rankings,
-decoded/converted definition exports, debug dumps and checkpoints remain private.
-The root `.gitignore` protects their filenames throughout the repository. Writers
-also add output-local ignore rules so custom output directories protect private
-artifacts. Ignore rules do not prevent deliberate force-adds; review exports
-before publishing them.
+Any dataset generated from the licensed CSS Electronics J1939 database remains
+private, including raw CAN frames and synchronized measurements. Although these
+files use opaque labels rather than names, the inference system can still use
+the paired inputs to reconstruct signal encodings. Only aggregate statistics,
+plots, methodology, source code and deliberately invented synthetic test
+datasets are intended for public distribution.
+
+J1939 sources default to `private_derived_output=True`. Output writers install
+local ignore rules for `can_frames*.csv` and `known_values*.csv`, including
+observation-count subsets, alongside ground truth, catalogs, inferred encodings,
+candidate rankings, private metadata, decoded/converted exports, debug dumps,
+checkpoints and temporary checkpoint files. Custom output directories and
+resumed runs receive the same protection. The raw-data rules apply locally to
+licensed-derived J1939 runs and do not globally block unrelated synthetic or
+NMEA experiments. Ignore rules do not prevent deliberate force-adds.
 
 Public evaluation JSON contains summary accuracy/error statistics and opaque
 per-signal IDs with correctness/error metrics. Full-library result CSVs exclude
@@ -398,12 +407,17 @@ real names, units, PGNs, start bits, widths, byte order, signedness, factors,
 offsets, ranges, and per-signal transport/alignment mappings. True widths and
 categories are used only in memory to compute aggregate breakdowns and plots.
 
-Raw frame CSVs and new opaque measurement CSVs can be shared if they contain no
-hidden definitions. Legacy named measurement files and detailed exports remain
-private under `data/j1939/`; regenerate them before sharing. Existing full-library
-checkpoints use an older configuration schema: choose a new output directory
-when regenerating the experiment. Database-independent NMEA 2000 and synthetic
-unit tests remain available without the licensed J1939 file.
+Invented fixtures in `tests/synthetic_j1939.py` contain no licensed rows.
+Their test loader explicitly uses `private_derived_output=False`, allowing the
+invented raw/measurement datasets to remain public and usable. Never opt out for
+licensed definitions or a subset copied from them. Database-independent NMEA
+and synthetic tests run without the paid J1939 file; run
+`uv run pytest tests/test_j1939_inference.py` for small invented-data recovery
+demonstrations. Use a new output directory for legacy checkpoint-based runs.
+
+Historical licensed objects were removed from reachable refs, but GitHub
+server-side retained/cached objects may require GitHub Support cleanup before
+the repository is made public. Keep it private until that cleanup is confirmed.
 
 ## Project layout
 

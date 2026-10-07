@@ -97,13 +97,15 @@ def run_j1939_search_space_comparison(
     min_pairs: int = 8,
     min_pairing_fraction: float = 0.5,
     top_k: int = 10,
+    private_derived_output: bool = True,
 ) -> list[dict[str, object]]:
     """Measure aligned 8/16/32 search against generic extended search."""
 
     dataset = Path(dataset_directory)
     output = Path(output_directory)
     output.mkdir(parents=True, exist_ok=True)
-    protect_private_outputs(output)
+    protect_private_outputs(output, private_derived_output=private_derived_output)
+    protect_private_outputs(dataset, private_derived_output=private_derived_output)
     selected, selected_metadata = _stratified_extended_targets(
         dataset,
         min_bit_length=min_bit_length,
@@ -300,6 +302,8 @@ def run_j1939_experiment(
     output.mkdir(parents=True, exist_ok=True)
     protect_private_outputs(output)
     database = load_j1939_database(database_path)
+    # Observation-count subsets are also reconstructable licensed inputs.
+    protect_private_outputs(output, private_derived_output=database.private_derived_output)
     selected_signals, selected_messages = _select_aligned_population(
         database, max_signals
     )

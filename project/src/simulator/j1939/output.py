@@ -31,7 +31,7 @@ def write_j1939_outputs(
 ) -> dict[str, object]:
     output = Path(output_directory)
     output.mkdir(parents=True, exist_ok=True)
-    protect_private_outputs(output)
+    protect_private_outputs(output, private_derived_output=database.private_derived_output)
     category = str(result.options["category"])
     include_transport = bool(result.options["include_transport"])
     eligible_messages = [
@@ -164,7 +164,8 @@ def write_j1939_outputs(
         "protocol": "J1939",
         "database_version": database.database_version,
         "schema_version": database.schema_version,
-        "output_schema_version": 2,
+        "output_schema_version": 3,
+        "private_derived_output": database.private_derived_output,
         "number_of_messages_loaded": len(database.messages),
         "number_of_pgns_loaded": len({message.pgn for message in database.messages}),
         "number_of_signals_loaded": database.signal_count,

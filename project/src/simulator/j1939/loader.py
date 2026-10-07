@@ -28,7 +28,10 @@ def _decimal(value: object) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
 
 
-def load_j1939_database(path: str | Path | None = None) -> J1939Database:
+def load_j1939_database(
+    path: str | Path | None = None, *, private_derived_output: bool = True,
+) -> J1939Database:
+    """Load private definitions by default; only invented fixtures may opt out."""
     source = resolve_j1939_database_path(path)
     if not source.is_file():
         raise FileNotFoundError(
@@ -117,4 +120,5 @@ def load_j1939_database(path: str | Path | None = None) -> J1939Database:
         messages=tuple(messages),
         signal_count=signal_counter,
         aligned_signal_count=aligned_count,
+        private_derived_output=private_derived_output,
     )

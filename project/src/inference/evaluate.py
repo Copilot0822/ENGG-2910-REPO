@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-from inference.output_privacy import public_signal_results
+from inference.output_privacy import public_signal_results, public_summary
 
 
 def _location_matches(candidate: dict[str, Any], truth: dict[str, Any]) -> bool:
@@ -201,7 +201,7 @@ def write_evaluation(path: str | Path, evaluation: dict[str, Any]) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(
         json.dumps({
-            "summary": evaluation["summary"],
+            "summary": public_summary(evaluation["summary"]),
             "signals": public_signal_results(evaluation.get("signals", [])),
         }, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )

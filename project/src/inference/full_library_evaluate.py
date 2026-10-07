@@ -16,7 +16,18 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from inference.output_privacy import public_signal_results
+from inference.output_privacy import public_signal_results, public_summary
+
+
+AMBIGUITY_RULE = (
+    "The effective raw interval is derived from the intersection of the "
+    "declared raw and physical ranges. Signedness is ambiguous when that "
+    "entire interval lies below the sign bit. Declared width is ambiguous "
+    "when its upper bits are zero throughout the interval and a shorter "
+    "candidate at the same PGN/start produces the same raw values. A "
+    "result is AMBIGUOUS only when PGN, start, byte order, scale, and "
+    "offset are otherwise correct over the complete valid interval."
+)
 
 
 RESULT_COLUMNS = [
@@ -319,25 +330,33 @@ def evaluate_full_library(
         "by_bit_length": by_width,
         "by_alignment": by_alignment,
         "by_transport": by_transport,
-        "ambiguity_rule": (
-            "The effective raw interval is derived from the intersection of the "
-            "declared raw and physical ranges. Signedness is ambiguous when that "
-            "entire interval lies below the sign bit. Declared width is ambiguous "
-            "when its upper bits are zero throughout the interval and a shorter "
-            "candidate at the same PGN/start produces the same raw values. A "
-            "result is AMBIGUOUS only when PGN, start, byte order, scale, and "
-            "offset are otherwise correct over the complete valid interval."
-        ),
+        "ambiguity_rule": AMBIGUITY_RULE,
         "evaluation_runtime_seconds": time.perf_counter() - started,
         "rows": rows,
     }
 
 
 def write_evaluation_json(path: str | Path, evaluation: dict[str, Any]) -> None:
-    document = {key: evaluation[key] for key in (
-        "summary", "by_bit_length", "by_alignment", "by_transport",
-        "ambiguity_rule", "evaluation_runtime_seconds",
-    ) if key in evaluation}
+    document: dict[str, Any] = {"summary": public_summary(evaluation.get("summary", {}))}
+    for key, allowed in (
+        ("by_bit_length", None),
+        ("by_alignment", {"aligned_8_16_32", "non_aligned_or_other_width"}),
+        ("by_transport", {"single_frame", "BAM", "RTS_CTS"}),
+    ):
+        if key in evaluation:
+            document[key] = {
+                label: public_summary(summary)
+                for label, summary in evaluation[key].items()
+                if isinstance(summary, dict) and (
+                    label in allowed if allowed is not None
+                    else str(label).isdecimal() and int(label) > 0
+                )
+            }
+    if "ambiguity_rule" in evaluation:
+        document["ambiguity_rule"] = AMBIGUITY_RULE
+    runtime = evaluation.get("evaluation_runtime_seconds")
+    if type(runtime) in (int, float) and math.isfinite(runtime):
+        document["evaluation_runtime_seconds"] = runtime
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(

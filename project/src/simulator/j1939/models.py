@@ -73,6 +73,8 @@ class J1939Database:
     messages: tuple[J1939Message, ...]
     signal_count: int
     aligned_signal_count: int
+    # Opt out only for deliberately invented definitions, never licensed rows.
+    private_derived_output: bool = True
 
     @property
     def single_frame_messages(self) -> tuple[J1939Message, ...]:

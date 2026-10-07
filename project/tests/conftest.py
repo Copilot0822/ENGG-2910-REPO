@@ -23,7 +23,7 @@ def synthetic_j1939_path(tmp_path_factory):
 
 @pytest.fixture(scope="session")
 def j1939_database(synthetic_j1939_path):
-    return load_j1939_database(synthetic_j1939_path)
+    return load_j1939_database(synthetic_j1939_path, private_derived_output=False)
 
 
 @pytest.fixture(scope="session")

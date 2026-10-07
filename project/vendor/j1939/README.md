@@ -24,13 +24,22 @@ does not contain the licensed J1939 definitions. Discovery receives only CAN
 frames and synchronized measurements; ground-truth definitions are used locally
 by simulation and subsequent evaluation.
 
-Generated catalogs, ground truth, inferred encodings, conversion/debug exports,
-and inference checkpoints can expose or reconstruct licensed definitions. Keep
-these artifacts local. The repository ignores their filenames throughout the
-tree; output writers also create local ignore rules for custom directories.
+Any dataset generated from the licensed CSS Electronics J1939 database remains
+private, including raw CAN frames and synchronized measurements. Opaque labels
+and blank units do not make these inputs safe to publish: the inference system
+can reconstruct signal encodings from the paired data. Catalogs, ground truth,
+inferred encodings, candidate rankings, private metadata, decoded/converted
+exports and checkpoints must also stay local. Writers install output-local
+ignore rules even for custom directories and resumed runs.
 
-New CAN-frame and measurement CSVs contain only raw traffic, opaque labels and
-values, with blank units. Public evaluation JSON/CSV contains aggregate results
-and opaque per-signal accuracy/error metrics, without names or true definitions.
-Legacy datasets with real names or units remain private and must be regenerated
-before sharing. Use a new output directory for old checkpoint-based runs.
+Only aggregate statistics, plots, methodology, source code and deliberately
+invented synthetic test datasets are intended for public distribution. Public
+per-signal results use opaque IDs with correctness/error metrics and omit
+definitions, names, units and original database ID mappings. The invented test
+fixtures keep the project testable without a paid database. J1939 sources default
+to private output; only deliberately invented definitions may explicitly use
+`private_derived_output=False`. Use a new directory for legacy checkpoint runs.
+
+Historical licensed objects were removed from reachable refs, but GitHub
+server-side retained/cached objects may require GitHub Support cleanup before
+the repository is made public. Keep it private until that cleanup is confirmed.
