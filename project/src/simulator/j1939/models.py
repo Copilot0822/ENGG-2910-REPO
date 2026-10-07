@@ -68,8 +68,6 @@ class J1939Message:
 @dataclass(frozen=True, slots=True)
 class J1939Database:
     path: Path
-    json_sha256: str
-    source_dbc_sha256: str
     database_version: str
     schema_version: str
     messages: tuple[J1939Message, ...]
@@ -129,4 +127,3 @@ class J1939SimulationResult:
     logical_message_count: int = 0
     time_step_count: int = 0
     options: dict[str, object] = field(default_factory=dict)
-

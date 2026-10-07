@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import math
 import re
@@ -17,6 +16,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from inference.loader import LogicalMessage, load_logical_messages
+from inference.output_privacy import protect_private_file, protect_private_outputs
 from inference.regression import fit_linear
 from inference.scoring import score_candidate
 
@@ -557,14 +557,15 @@ def _process_stream(
 
 
 def _config_digest(config: dict[str, object]) -> str:
-    encoded = json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
+    # Compare the complete configuration directly; do not store checksum values.
+    return json.dumps(config, sort_keys=True, separators=(",", ":"))
 
 
 def write_batch_checkpoint(
     path: Path, batch_index: int, digest: str, payload: dict[str, object]
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    protect_private_file(path)
     document = {"batch_index": batch_index, "config_digest": digest, **payload}
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
@@ -656,23 +657,21 @@ def infer_full_library(
     started = time.perf_counter()
     output = Path(output_directory)
     output.mkdir(parents=True, exist_ok=True)
+    protect_private_outputs(output)
     checkpoints = output / "checkpoints"
     streams, load_metadata = load_full_library_inputs(
         can_path, known_path, selected_signals=selected_signals
     )
     batches = make_stream_batches(streams, batch_size)
-    selection_digest = hashlib.sha256(
-        "\n".join(sorted(selected_signals or ())).encode()
-    ).hexdigest()
     config: dict[str, object] = {
-        "algorithm_version": 2,
+        "algorithm_version": 3,
         "protocol": "j1939",
         "mode": mode,
         "bit_lengths": list(bit_lengths),
         "batch_size": batch_size,
         "candidate_batch_size": candidate_batch_size,
         "top_k": top_k,
-        "selection_sha256": selection_digest,
+        "selected_signals": sorted(selected_signals) if selected_signals is not None else None,
         "can_input": str(can_path),
         "known_values_input": str(known_path),
         "target_count": sum(len(stream.targets) for stream in streams),

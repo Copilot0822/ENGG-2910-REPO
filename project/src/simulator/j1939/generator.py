@@ -328,10 +328,10 @@ class J1939DatasetGenerator:
                     sample_id,
                     timestamp,
                     self.observation_id,
-                    f"{signal.name} [{signal.signal_id}]",
+                    f"signal_{signal.signal_id.rsplit('_', 1)[-1]} [{signal.signal_id}]",
                     signal.signal_id,
                     value.physical_value,
-                    signal.unit,
+                    "",
                 )
             )
             self.observation_id += 1

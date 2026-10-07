@@ -1,2 +1,25 @@
 __pycache__/
 *.py[cod]
+
+# Private CAN answer keys, inferred definitions, conversions and checkpoints.
+# These apply throughout the repository, including custom output directories.
+ground_truth*.json
+signal_catalog*.csv
+inferred_signals*.json
+candidate_rankings*.csv
+simulation_metadata.json
+experiment_metadata.json
+comparison_metadata.json
+inference_metadata.json
+run_config.json
+**/checkpoints/
+**/private/
+*decoded*.json
+*decoded*.csv
+*definition*.json
+*definition*.csv
+*signal_mapping*.json
+*signal_mapping*.csv
+*debug_dump*
+*.sha256
+*.sha256.*

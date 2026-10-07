@@ -16,6 +16,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from inference.output_privacy import public_signal_results
+
 
 RESULT_COLUMNS = [
     "signal_id",
@@ -288,9 +290,11 @@ def evaluate_full_library(
     destination = Path(result_csv_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=RESULT_COLUMNS, lineterminator="\n")
+        public_rows = public_signal_results(rows)
+        columns = [key for key in RESULT_COLUMNS if key in public_rows[0]] if public_rows else ["signal_id"]
+        writer = csv.DictWriter(handle, fieldnames=columns, lineterminator="\n")
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(public_rows)
 
     by_width: dict[str, dict[str, Any]] = {}
     groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -330,7 +334,10 @@ def evaluate_full_library(
 
 
 def write_evaluation_json(path: str | Path, evaluation: dict[str, Any]) -> None:
-    document = {key: value for key, value in evaluation.items() if key != "rows"}
+    document = {key: evaluation[key] for key in (
+        "summary", "by_bit_length", "by_alignment", "by_transport",
+        "ambiguity_rule", "evaluation_runtime_seconds",
+    ) if key in evaluation}
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(

@@ -17,6 +17,7 @@ from inference.experiments import (
 )
 from inference.infer import infer_signals
 from inference.output import write_inference_outputs
+from inference.output_privacy import protect_private_outputs
 from simulator.j1939.generator import J1939DatasetGenerator
 from simulator.j1939.loader import load_j1939_database
 from simulator.j1939.models import J1939Database, J1939Message
@@ -102,6 +103,7 @@ def run_j1939_search_space_comparison(
     dataset = Path(dataset_directory)
     output = Path(output_directory)
     output.mkdir(parents=True, exist_ok=True)
+    protect_private_outputs(output)
     selected, selected_metadata = _stratified_extended_targets(
         dataset,
         min_bit_length=min_bit_length,
@@ -196,7 +198,7 @@ def _select_aligned_population(
 ) -> tuple[set[str], list[J1939Message]]:
     eligible = sorted(
         (
-            f"{signal.name} [{signal.signal_id}]",
+            f"signal_{signal.signal_id.rsplit('_', 1)[-1]} [{signal.signal_id}]",
             message.definition_id,
         )
         for message in database.single_frame_messages
@@ -278,7 +280,7 @@ def _write_cross_protocol(path: Path, rows: list[dict[str, object]]) -> None:
 
 def run_j1939_experiment(
     *,
-    database_path: str | Path,
+    database_path: str | Path | None,
     output_directory: str | Path,
     observation_counts: Iterable[int],
     seed: int,
@@ -296,6 +298,7 @@ def run_j1939_experiment(
         raise ValueError("observation counts must be nonempty and at least min_pairs")
     output = Path(output_directory)
     output.mkdir(parents=True, exist_ok=True)
+    protect_private_outputs(output)
     database = load_j1939_database(database_path)
     selected_signals, selected_messages = _select_aligned_population(
         database, max_signals
@@ -383,7 +386,6 @@ def run_j1939_experiment(
         "selected_message_count": len(selected_messages),
         "generation_strategy": "targeted messages on disjoint sample ranges",
         "database_version": database.database_version,
-        "json_sha256": database.json_sha256,
         "single_frame_baseline": True,
         "target_category": "aligned_8_16_32",
     }

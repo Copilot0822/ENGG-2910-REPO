@@ -31,7 +31,7 @@ def test_j1939_coverage_reaches_aligned_single_frame_targets(j1939_database):
         for signal in message.target_signals("aligned_8_16_32")
     }
     assert observed == expected
-    assert len(expected) == 5493
+    assert len(expected) == 4
 
 
 def test_all_linear_definitions_generate_with_transport(j1939_database):
@@ -48,8 +48,8 @@ def test_all_linear_definitions_generate_with_transport(j1939_database):
         for signal in message.target_signals("all_linear")
     }
     assert observed == expected
-    assert len(expected) == 13774
-    assert result.logical_message_count == 2043
+    assert len(expected) == 10
+    assert result.logical_message_count == 4
     assert len(result.frames) > result.logical_message_count
     assert all(len(frame.data) <= 8 for frame in result.frames)
 

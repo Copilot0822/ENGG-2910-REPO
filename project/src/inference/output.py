@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from inference.infer import InferenceRun
+from inference.output_privacy import protect_private_outputs
 
 
 RANKING_COLUMNS = [
@@ -37,6 +38,7 @@ RANKING_COLUMNS = [
 def write_inference_outputs(output_directory: str | Path, run: InferenceRun) -> None:
     output = Path(output_directory)
     output.mkdir(parents=True, exist_ok=True)
+    protect_private_outputs(output)
     signals = {signal.signal_name: signal.to_dict() for signal in run.signals}
     (output / "inferred_signals.json").write_text(
         json.dumps({"metadata": run.metadata, "signals": signals}, indent=2, sort_keys=True)
@@ -62,4 +64,3 @@ def write_inference_outputs(output_directory: str | Path, run: InferenceRun) -> 
                     }
                 )
                 writer.writerow(row)
-

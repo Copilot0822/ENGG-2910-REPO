@@ -13,9 +13,6 @@ from simulator.output import write_outputs
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_N2K_DATABASE = PROJECT_ROOT / "vendor" / "canboat" / "canboat.json"
-DEFAULT_J1939_DATABASE = (
-    PROJECT_ROOT / "vendor" / "j1939" / "J1939_2024-06_v2.4.json"
-)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,7 +30,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--messages-per-sample", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--database", type=Path)
+    parser.add_argument(
+        "--database", type=Path,
+        help="database JSON; J1939 defaults to J1939_DATABASE_PATH, then vendor/j1939",
+    )
     parser.add_argument(
         "--category",
         choices=("all_linear", "aligned_8_16_32"),
@@ -54,9 +54,9 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
         from simulator.j1939.loader import load_j1939_database
         from simulator.j1939.output import write_j1939_outputs
 
-        database_path = arguments.database or DEFAULT_J1939_DATABASE
         output = arguments.output or PROJECT_ROOT / "data" / "j1939" / "simulated"
-        database = load_j1939_database(database_path)
+        database = load_j1939_database(arguments.database)
+        database_path = database.path
         generator = J1939DatasetGenerator(database, arguments.seed)
         if arguments.mode == "random":
             result = generator.random_mode(

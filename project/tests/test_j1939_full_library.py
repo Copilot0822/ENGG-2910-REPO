@@ -57,13 +57,13 @@ def test_candidate_cache_reuses_vectors_and_extracts_larger_fields():
 
 def test_full_library_accounting_reconciles(j1939_database):
     accounting = _accounting(j1939_database)
-    assert accounting["total_j1939_signals"] == 13774
-    assert accounting["category_a_aligned_8_16_32"] == 6930
-    assert accounting["category_b_all_signals_1_through_32"] == 13718
-    assert accounting["category_c_larger_than_32_total"] == 56
-    assert accounting["category_c_larger_than_32_inferable"] == 56
+    assert accounting["total_j1939_signals"] == 10
+    assert accounting["category_a_aligned_8_16_32"] == 6
+    assert accounting["category_b_all_signals_1_through_32"] == 8
+    assert accounting["category_c_larger_than_32_total"] == 2
+    assert accounting["category_c_larger_than_32_inferable"] == 2
     assert accounting["unsupported_for_inference"] == 0
-    assert accounting["partition_reconciliation"]["sum"] == 13774
+    assert accounting["partition_reconciliation"]["sum"] == 10
     assert set(FULL_CANDIDATE_LENGTHS) >= {40, 56, 64}
 
 

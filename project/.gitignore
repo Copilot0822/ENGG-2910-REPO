@@ -6,3 +6,10 @@ data/simulated/
 data/inference/
 data/experiments*/
 data/j1939/
+
+# Licensed local J1939 databases and their checksum sidecars (keep README.md).
+vendor/j1939/**/*.[jJ][sS][oO][nN]
+vendor/j1939/**/*.[jJ][sS][oO][nN].*
+vendor/j1939/**/*.[dD][bB][cC]
+vendor/j1939/**/*.[dD][bB][cC].*
+vendor/j1939/**/*.[sS][hH][aA]256

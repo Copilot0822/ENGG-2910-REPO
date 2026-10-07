@@ -158,7 +158,7 @@ def _write_search_analysis(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def run_full_library_experiment(
     *,
-    database_path: str | Path,
+    database_path: str | Path | None,
     output_directory: str | Path,
     observations_per_signal: int = 200,
     seed: int = 42,
@@ -211,7 +211,12 @@ def run_full_library_experiment(
         simulated / "ground_truth.json",
         simulated / "simulation_metadata.json",
     )
-    if resume and all(path.exists() for path in required_dataset):
+    existing_metadata = (
+        json.loads((simulated / "simulation_metadata.json").read_text(encoding="utf-8"))
+        if resume and all(path.exists() for path in required_dataset)
+        else {}
+    )
+    if existing_metadata.get("output_schema_version") == 2:
         simulation_metadata = json.loads(
             (simulated / "simulation_metadata.json").read_text(encoding="utf-8")
         )
@@ -243,7 +248,7 @@ def run_full_library_experiment(
     }
     unsupported_ids = set(accounting["unsupported_signal_ids"])
     aligned_labels = {
-        f"{definition['name']} [{signal_id}]"
+        f"signal_{signal_id.rsplit('_', 1)[-1]} [{signal_id}]"
         for signal_id, definition in truth.items()
         if signal_id in aligned_ids
     }

@@ -8,6 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Iterable
 
+from inference.output_privacy import protect_private_outputs
 from simulator import __version__
 from simulator.j1939.models import J1939Database, J1939SimulationResult, TargetCategory
 
@@ -30,6 +31,7 @@ def write_j1939_outputs(
 ) -> dict[str, object]:
     output = Path(output_directory)
     output.mkdir(parents=True, exist_ok=True)
+    protect_private_outputs(output)
     category = str(result.options["category"])
     include_transport = bool(result.options["include_transport"])
     eligible_messages = [
@@ -68,9 +70,9 @@ def write_j1939_outputs(
                 item.sample_id,
                 f"{item.timestamp:.2f}",
                 item.observation_id,
-                item.signal_name,
+                f"signal_{item.signal_id.rsplit('_', 1)[-1]} [{item.signal_id}]",
                 str(item.value),
-                item.unit,
+                "",
             ]
             for item in result.observations
         ),
@@ -162,8 +164,7 @@ def write_j1939_outputs(
         "protocol": "J1939",
         "database_version": database.database_version,
         "schema_version": database.schema_version,
-        "json_sha256": database.json_sha256,
-        "source_dbc_sha256": database.source_dbc_sha256,
+        "output_schema_version": 2,
         "number_of_messages_loaded": len(database.messages),
         "number_of_pgns_loaded": len({message.pgn for message in database.messages}),
         "number_of_signals_loaded": database.signal_count,
@@ -180,7 +181,10 @@ def write_j1939_outputs(
         "number_of_logical_messages": result.logical_message_count,
         "number_of_physical_can_frames": len(result.frames),
         "total_target_observations": len(result.observations),
-        "command_line_options": result.options,
+        "command_line_options": {
+            key: value for key, value in result.options.items()
+            if key not in {"database", "output"}
+        },
     }
     (output / "simulation_metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"

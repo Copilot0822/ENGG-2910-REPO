@@ -80,6 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--database",
         type=Path,
         default=None,
+        help="database JSON; J1939 defaults to J1939_DATABASE_PATH, then vendor/j1939",
     )
     experiment_parser.add_argument(
         "--output", type=Path, default=None
@@ -121,7 +122,8 @@ def build_parser() -> argparse.ArgumentParser:
     full_parser.add_argument(
         "--database",
         type=Path,
-        default=PROJECT_ROOT / "vendor" / "j1939" / "J1939_2024-06_v2.4.json",
+        default=None,
+        help="licensed JSON; defaults to J1939_DATABASE_PATH, then vendor/j1939",
     )
     full_parser.add_argument(
         "--output",
@@ -221,8 +223,7 @@ def main(argv: list[str] | None = None) -> None:
         from simulator.j1939.experiments import run_j1939_experiment
 
         rows = run_j1939_experiment(
-            database_path=arguments.database
-            or PROJECT_ROOT / "vendor" / "j1939" / "J1939_2024-06_v2.4.json",
+            database_path=arguments.database,
             output_directory=arguments.output
             or PROJECT_ROOT / "data" / "j1939" / "experiments",
             observation_counts=arguments.observation_counts,

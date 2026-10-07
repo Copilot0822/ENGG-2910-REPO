@@ -32,7 +32,7 @@ uv run python -m simulator --protocol nmea2000 --mode coverage --min-observation
 uv run python -m inference infer --protocol nmea2000 --can data/simulated/can_frames.csv --known data/simulated/known_values.csv --output data/inference --mode aligned --top-k 10
 uv run python -m inference evaluate --protocol nmea2000 --inferred data/inference/inferred_signals.json --ground-truth data/simulated/ground_truth.json
 
-# J1939 single-frame aligned baseline
+# J1939: first provide your own licensed normalized JSON (see below)
 uv run python -m simulator --protocol j1939 --mode coverage --min-observations-per-field 200 --seed 42 --category aligned_8_16_32 --messages-per-sample 96
 uv run python -m inference infer --protocol j1939 --can data/j1939/simulated/can_frames.csv --known data/j1939/simulated/known_values.csv --output data/j1939/inference/aligned_full --mode aligned --top-k 10
 uv run python -m inference evaluate --protocol j1939 --inferred data/j1939/inference/aligned_full/inferred_signals.json --ground-truth data/j1939/simulated/ground_truth.json
@@ -65,9 +65,53 @@ space configured independently of the answer key.
 
 ## J1939 database
 
-`vendor/j1939/J1939_2024-06_v2.4.json` is the unmodified normalized conversion
-supplied for this project. The loader validates the actual file rather than
-hard-coding database properties. It found:
+The J1939 research uses the **paid/licensed CSS Electronics SAE J1939
+DBC/database**, intentionally not included in this repository because
+redistribution is not permitted. To reproduce database-dependent experiments,
+users must supply their own licensed copy. Obtain it from
+[CSS Electronics](https://www.csselectronics.com/products/j1939-dbc-file).
+The local research version is currently `J1939_2024-06_v2.4`.
+
+The runtime expects the project's normalized JSON conversion, not a raw DBC.
+There is no automatic download. All database-dependent J1939 entry points
+(simulator, observation study, and full-library experiment) use this precedence:
+
+1. Explicit `--database` path.
+2. `J1939_DATABASE_PATH` environment variable.
+3. Local `vendor/j1939/J1939_2024-06_v2.4.json` under this project.
+
+For example, from the `project` directory:
+
+```powershell
+# Use an external licensed JSON without copying it into the repository
+$env:J1939_DATABASE_PATH = 'C:\LicensedData\J1939_2024-06_v2.4.json'
+uv run python -m simulator --protocol j1939 --samples 100
+uv run python -m inference experiment --protocol j1939 --modes aligned
+uv run python -m inference full-library --resume
+
+# An explicit path overrides the environment setting
+uv run python -m simulator --protocol j1939 --database 'C:\LicensedData\local.json'
+```
+
+Alternatively place the licensed normalized JSON in
+[`vendor/j1939/`](vendor/j1939/README.md). Database files and checksum sidecars
+there are ignored by Git. If the selected file is absent, loading fails with
+instructions to provide `--database` or `J1939_DATABASE_PATH`; it does not fall
+back from an invalid explicit or environment path.
+
+Public unit tests use small, invented definitions and run without the paid
+database. The licensed-database integration test skips cleanly when no local
+copy is available. Run only public tests with `uv run pytest -m 'not integration'`
+or local licensed checks with `uv run pytest -m integration`.
+
+Simulation uses the local definitions to encode frames, and evaluation uses
+local ground truth after discovery. **The inference algorithm does not receive
+ground-truth definitions during discovery.** The simulator, inference engine,
+least-squares implementation, evaluation, experiment definitions, methodology,
+and aggregate results remain public.
+
+The loader validates the supplied file rather than hard-coding database
+properties. The research version yielded these aggregate counts:
 
 | Property | Validated count |
 | --- | ---: |
@@ -79,11 +123,9 @@ hard-coding database properties. It found:
 | All-linear signals in single-frame messages | 12,165 |
 | Aligned 8/16/32 targets in single-frame messages | 5,493 |
 
-The database metadata contains the SHA-256 of the source DBC, not the converted
-JSON. Therefore the project preserves that embedded source digest and pins the
-JSON itself with the adjacent `.json.sha256` file. Loading fails if the JSON's
-calculated SHA-256 does not match the sidecar. The pinned JSON SHA-256 is
-``.
+J1939 checksum values and sidecars are not stored, generated, or required by the
+runtime. A normalized JSON without checksum metadata is sufficient. Version,
+schema, seed, experiment options and aggregate counts document reproducibility.
 The original DBC is not needed at runtime.
 
 The simulator reads start bit, width, byte order, signedness, factor, offset,
@@ -312,9 +354,12 @@ candidate definitions and evaluated 89,775,236 regressions in 83.07 seconds:
 simulation, both searches, evaluation, serialization, and plotting took 142.76
 seconds.
 
-Detailed per-signal results, accuracy-by-width/alignment/transport tables,
-search-space measurements, and five summary plots are under
-`data/j1939/full_library/`.
+Local runs write per-signal results, aggregate accuracy tables, search-space
+measurements, and summary plots under the ignored `data/j1939/full_library/`.
+Catalogs, ground truth, per-signal inferred encodings, and checkpoints may
+reconstruct licensed definitions and must remain local. Publish only plots or
+aggregate results that do not reproduce those definitions. Custom output paths
+outside the ignored J1939 data directory also need protection before committing.
 
 ## Output schemas
 
@@ -333,9 +378,32 @@ There are no decoded PGNs or signal definitions in this file.
 sample_id,timestamp,observation_id,signal_name,value,unit
 ```
 
-J1939 labels include a neutral stable identifier to disambiguate duplicate
-names. The mapping to SPN, real name, PGN, location, encoding, database identity,
-and message length is retained only in ground truth and the catalog.
+J1939 measurement labels are opaque, for example
+`signal_000001 [j1939_signal_000001]`, and the `unit` column is blank. The mapping
+to SPN, real name, PGN, location, encoding and message length is retained only
+in the private local ground truth and catalog.
+
+## Generated data and public results
+
+Licensed-derived answer keys, catalogs, inferred encodings, candidate rankings,
+decoded/converted definition exports, debug dumps and checkpoints remain private.
+The root `.gitignore` protects their filenames throughout the repository. Writers
+also add output-local ignore rules so custom output directories protect private
+artifacts. Ignore rules do not prevent deliberate force-adds; review exports
+before publishing them.
+
+Public evaluation JSON contains summary accuracy/error statistics and opaque
+per-signal IDs with correctness/error metrics. Full-library result CSVs exclude
+real names, units, PGNs, start bits, widths, byte order, signedness, factors,
+offsets, ranges, and per-signal transport/alignment mappings. True widths and
+categories are used only in memory to compute aggregate breakdowns and plots.
+
+Raw frame CSVs and new opaque measurement CSVs can be shared if they contain no
+hidden definitions. Legacy named measurement files and detailed exports remain
+private under `data/j1939/`; regenerate them before sharing. Existing full-library
+checkpoints use an older configuration schema: choose a new output directory
+when regenerating the experiment. Database-independent NMEA 2000 and synthetic
+unit tests remain available without the licensed J1939 file.
 
 ## Project layout
 
@@ -346,7 +414,7 @@ src/inference/                 protocol-neutral regression, ranking, output, eva
 src/inference/j1939_tp.py      inference-side metadata-free TP reassembly
 tests/                         unit, integration, leakage, and reproducibility tests
 vendor/canboat/                pinned Canboat JSON
-vendor/j1939/                  pinned J1939 JSON and checksum sidecar
+vendor/j1939/                  public setup README; ignored licensed local JSON
 data/simulated/                generated NMEA 2000 output (ignored by Git)
 data/j1939/                    generated J1939 output (ignored by Git)
 ```

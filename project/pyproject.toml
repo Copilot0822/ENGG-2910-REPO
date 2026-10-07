@@ -25,3 +25,4 @@ build-backend = "uv_build"
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+markers = ["integration: requires a licensed local J1939 database; skips when absent"]
