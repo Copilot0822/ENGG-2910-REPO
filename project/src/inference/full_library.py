@@ -568,6 +568,7 @@ def write_batch_checkpoint(
     protect_private_file(path)
     document = {"batch_index": batch_index, "config_digest": digest, **payload}
     temporary = path.with_suffix(path.suffix + ".tmp")
+    protect_private_file(temporary)
     temporary.write_text(
         json.dumps(document, separators=(",", ":")) + "\n", encoding="utf-8"
     )

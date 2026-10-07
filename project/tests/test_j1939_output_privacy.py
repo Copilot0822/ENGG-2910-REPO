@@ -3,7 +3,7 @@ import json
 import subprocess
 
 from inference.evaluate import write_evaluation
-from inference.full_library import _config_digest
+from inference.full_library import _config_digest, write_batch_checkpoint
 from inference.full_library_evaluate import evaluate_full_library, write_evaluation_json
 from inference.output_privacy import protect_private_outputs, public_signal_results
 from simulator.j1939.generator import J1939DatasetGenerator
@@ -41,6 +41,10 @@ def test_custom_output_directory_is_protected_even_outside_project(tmp_path):
         "candidate_rankings.csv", "run_config.json", "checkpoints/batch_00000.json",
     )
     for name in private_names:
+        result = subprocess.run(["git", "check-ignore", "custom/" + name], cwd=tmp_path)
+        assert result.returncode == 0
+    write_batch_checkpoint(output / "custom_cache.json", 0, _config_digest({}), {"signals": {}})
+    for name in ("custom_cache.json", "custom_cache.json.tmp"):
         result = subprocess.run(["git", "check-ignore", "custom/" + name], cwd=tmp_path)
         assert result.returncode == 0
     for name in ("can_frames.csv", "known_values.csv", "evaluation_results.json", "full_library_results.csv"):
