@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+data/
+private/
+models/
+exports/
+*.zip
+*.fit
+*.fit.gz
+*.gpx
+*.tcx
+*.osm
+*.osm.gz
+*.pbf
+*.sqlite*
+*.db
+*.parquet
+*.joblib
+*.log
+.env
+.streamlit/secrets.toml
+config.local.json
+# All test fixtures are generated in memory; no private sample recordings belong here.
