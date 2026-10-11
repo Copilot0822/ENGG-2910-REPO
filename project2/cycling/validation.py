@@ -30,7 +30,7 @@ OSM_COLUMNS = [
 ]
 
 
-def held_out_route(points, ride, settings):
+def held_out_route(points, ride, settings, weather_segments=None):
     """Only geometry/elevation and reusable OSM enter the test route, never observed ride dynamics."""
     raw = points[["lat", "lon", "elevation"]].copy()
     raw["track_group"] = points.group
@@ -39,7 +39,32 @@ def held_out_route(points, ride, settings):
         clean[col] = points[col].to_numpy()
     events = route_events(clean)
     neutral = {"id": "route", "date": ride["date"], "bike": ride.get("bike", "unknown")}
-    return build_segments(clean, neutral, events, historical=False), events
+    route = build_segments(clean, neutral, events, historical=False)
+    if weather_segments is not None and "weather_available" in weather_segments:
+        route = attach_retrospective_weather(route, weather_segments)
+    return route, events
+
+
+def attach_retrospective_weather(route, weather_segments):
+    """Observed external conditions at actual passage times, explicitly retrospective.
+
+    Only weather columns are copied. Recorded effort, speed and interruption outcomes
+    never enter the predictive features. Forecast skill must be evaluated separately.
+    """
+    from .weather import WEATHER_NUMERIC
+
+    source = weather_segments.sort_values("end_m")
+    x = (source.start_m.to_numpy() + source.end_m.to_numpy()) / 2
+    t = (route.start_m.to_numpy() + route.end_m.to_numpy()) / 2
+    nearest = np.argmin(abs(x[:, None] - t[None, :]), axis=0)
+    result = route.copy()
+    for column in WEATHER_NUMERIC:
+        result[column] = np.interp(t, x, source[column].to_numpy())
+    for column in source.columns:
+        if column.startswith("weather_"):
+            result[column] = source[column].to_numpy()[nearest]
+    result["weather_source"] = "Retrospective ECCC observations at recorded passage times"
+    return result
 
 
 def chronological_splits(rides, minimum_train=4, max_tests=8):
@@ -61,7 +86,7 @@ def _fitness_multiplier(previous):
     return float(np.clip(1 + (np.median(ratios) - 1) * len(ratios) / (len(ratios) + 4), 0.9, 1.1))
 
 
-def _score(model, test, route, events, fitness=False):
+def _score(model, test, route, events, fitness=False, actual_encounters=()):
     target = test.get("measured_avg_hr")
     if target is not None and pd.isna(target):
         target = None
@@ -84,14 +109,47 @@ def _score(model, test, route, events, fitness=False):
         route.loc[route.surface_source.eq("known"), "distance_m"].sum() / route.distance_m.sum()
     )
     primary = route.groupby("surface").distance_m.sum().idxmax()
-    matched = float(
-        route.loc[route.map_confidence.ge(0.25), "distance_m"].sum() / route.distance_m.sum()
-    )
+    matched = float(route.loc[route.map_confidence.ge(0.5), "distance_m"].sum() / route.distance_m.sum())
     reliable = (
         bool(test.get("timestamp_reliable", False))
         and result["unknown_wait_events"] == 0
         and matched >= 0.7
+        and getattr(model, "variant", "C") in ("C", "CW")
+        and float(test.get("traffic_stationary_s", 0))
+        >= max(0, float(test.elapsed_s) - float(test.moving_s)) * 0.9
     )
+    traffic_rows = []
+    for actual in actual_encounters:
+        if not actual["reliable"] or actual["kind"] not in ("stop", "signal"):
+            continue
+        predicted = [
+            e
+            for e in result["events"]
+            if e["identity"] == actual["identity"] and abs(e["distance_m"] - actual["distance_m"]) < 60
+        ]
+        if not predicted or predicted[0]["stop_probability"] is None:
+            continue
+        e = predicted[0]
+        stopped = actual["behavior"] == "full_stop"
+        traffic_rows.append(
+            {
+                "kind": actual["kind"],
+                "actual_stop": stopped,
+                "probability": e["stop_probability"],
+                "brier": float((e["stop_probability"] - stopped) ** 2),
+                "actual_behavior": actual["behavior"],
+                "predicted_behavior": max(
+                    e["behavior_probabilities"], key=e["behavior_probabilities"].get
+                ),
+                "wait_absolute_error_s": abs(e["stationary_s"] - actual["stationary_s"]),
+                "conditional_wait_absolute_error_s": abs(
+                    e["conditional_wait_s"] - actual["stationary_s"]
+                )
+                if stopped and e["conditional_wait_s"] is not None
+                else None,
+                "local_encounters": e["local_encounters"],
+            }
+        )
     return {
         "ride_id": str(test.id),
         "date": str(test.date),
@@ -99,6 +157,15 @@ def _score(model, test, route, events, fitness=False):
         "elevation_gain_m": test.get("elevation_gain_m"),
         "dominant_surface": primary,
         "known_surface_fraction": known,
+        "paved_fraction": float(
+            route.loc[route.surface.eq("paved"), "distance_m"].sum() / route.distance_m.sum()
+        ),
+        "gravel_fraction": float(
+            route.loc[
+                route.surface.isin(["hardpack_gravel", "loose_gravel", "rough_natural"]), "distance_m"
+            ].sum()
+            / route.distance_m.sum()
+        ),
         "map_matched_fraction": matched,
         "actual_rolling_kmh": actual_speed,
         "predicted_rolling_kmh": result["rolling_kmh"],
@@ -123,6 +190,11 @@ def _score(model, test, route, events, fitness=False):
         "train_latest": model.support["last_ride"],
         "fitness_multiplier": model.fitness_adjustment,
         "warnings": result["warnings"],
+        "moving_loss_minutes": sum(e["moving_loss_s"] for e in result["events"]) / 60,
+        "stationary_wait_minutes": sum(e["stationary_s"] for e in result["events"]) / 60,
+        "predicted_event_count": len(result["events"]),
+        "unknown_wait_events": result["unknown_wait_events"],
+        "traffic_validation": traffic_rows,
     }
 
 

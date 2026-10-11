@@ -13,17 +13,26 @@ def speed_from_time(distance_m, time_s):
     return float(distance_m / time_s * 3.6) if time_s > 0 else 0.0
 
 
-def _allocate_events(frame, events, model, cruise, scenario, hour, weekday):
+def _allocate_events(frame, events, model, cruise, scenario, departure, moving, previous_waits):
     losses = np.zeros(len(frame))
     waits = np.zeros(len(frame))
     details = []
+    arrivals = np.cumsum(moving + previous_waits) - moving - previous_waits
     for event in events:
         ix = int(np.argmin(abs(frame.end_m.to_numpy() - event["distance_m"])))
-        estimate = model.behavior.predict(event, cruise[ix] / 3.6, scenario, hour, weekday)
+        fraction = float(
+            np.clip(
+                (event["distance_m"] - frame.start_m.iloc[ix]) / max(1, frame.distance_m.iloc[ix]), 0, 1
+            )
+        )
+        moment = departure + pd.Timedelta(seconds=float(arrivals[ix] + fraction * moving[ix]))
+        estimate = model.behavior.predict(
+            event, cruise[ix] / 3.6, scenario, moment.hour, moment.dayofweek
+        )
         # Charge each consolidated event once. Braking belongs to moving time; wait belongs to elapsed.
         losses[ix] += estimate["moving_loss_s"]
         waits[ix] += estimate["stationary_s"]
-        details.append({**event, **estimate, "segment": ix})
+        details.append({**event, **estimate, "segment": ix, "arrival_time_utc": moment.isoformat()})
     return losses, waits, details
 
 
@@ -37,6 +46,8 @@ def predict_route(
     personal_break_minutes=0.0,
     departure=None,
     use_fitness=False,
+    weather_provider=None,
+    weather_neutral=False,
 ):
     if len(segments) == 0:
         raise ValueError("The route contains no usable segments.")
@@ -46,18 +57,29 @@ def predict_route(
         raise ValueError("Personal break time cannot be negative.")
     if target_hr is not None and not 35 <= target_hr <= 230:
         raise ValueError("Target average HR must be between 35 and 230 BPM.")
-    frame = segments.copy()
+    from .comparison import prediction_inputs
+
+    frame, events = prediction_inputs(segments, events, getattr(model, "variant", "C"))
+    if weather_neutral:
+        from .weather import neutral_weather
+
+        frame = neutral_weather(frame)
     # Only route geometry enters prediction; recorded speed, HR, elapsed time and power are ignored.
     frame["moving_hours"] = 0.0
     frame["date"] = str(departure or datetime.now(timezone.utc).isoformat())
     moment = pd.Timestamp(frame.date.iloc[0])
     # Recording encounter hours are stored in UTC; compare departure context on the same clock.
-    event_moment = moment.tz_convert("UTC") if moment.tzinfo else moment
+    event_moment = moment.tz_convert("UTC") if moment.tzinfo else moment.tz_localize("UTC")
     frame["observation_day"] = moment.toordinal()
     frame["day_of_year"] = moment.dayofyear
     frame["bike"] = bike or "unknown"
     distance = float(frame.distance_m.sum())
     warnings = []
+    variant = getattr(model, "variant", "C")
+    if variant in ("A", "B"):
+        warnings.append(
+            f"Model {variant} was validated without explicit mapped traffic penalties. Elapsed time is a lower bound; select model C for mapped waits and full-stop traffic-control scenarios."
+        )
     if bike and bike not in model.support["bikes"]:
         warnings.append(
             "This bike was not observed during training; bike-specific effects are unavailable."
@@ -87,7 +109,14 @@ def predict_route(
         warnings.append(
             "Route elevation is missing or unreliable. Gradient is set to zero where unavailable; ascent and hill predictions are uncertain."
         )
-    unknown_fraction = float(frame.loc[frame.surface_source.ne("known"), "distance_m"].sum() / distance)
+    unknown_fraction = float(
+        segments.loc[segments.surface_source.ne("known"), "distance_m"].sum() / distance
+    )
+    actual_coverage = segments.attrs.get("osm_coverage")
+    if actual_coverage:
+        unknown_fraction = 1 - actual_coverage["sources"].get("known", 0) / max(
+            1e-9, actual_coverage["total_km"]
+        )
     if unknown_fraction > 0.2:
         warnings.append(
             f"{unknown_fraction:.0%} of route distance lacks verified OSM surfaces. Missing controls may understate travel time."
@@ -96,12 +125,17 @@ def predict_route(
     ds = frame.distance_m.to_numpy()
     cruise = model.predict_cruise(frame)
     moving = ds / (cruise / 3.6)
+    waits = np.zeros(len(frame))
     event_losses, waits, details = _allocate_events(
-        frame, events, model, cruise, scenario, event_moment.hour, event_moment.dayofweek
+        frame, events, model, cruise, scenario, event_moment, moving, waits
     )
     converged = False
     for iteration in range(20):
         frame["moving_hours"] = (np.cumsum(moving) - moving / 2) / 3600
+        arrival_s = np.cumsum(moving + waits) - moving - waits + moving / 2
+        frame["arrival_time_utc"] = event_moment + pd.to_timedelta(arrival_s, unit="s")
+        if weather_provider is not None and not weather_neutral:
+            frame = weather_provider.at(frame, frame.arrival_time_utc)
         if target_hr is not None:
             terrain_shape = np.clip(model.hr_profile.predict(profile_features(frame)), -25, 25)
 
@@ -115,7 +149,7 @@ def predict_route(
             hr_values = profile(brentq(constraint, -100, 100, xtol=0.01))
         cruise = model.predict_cruise(frame, hr_values if target_hr is not None else None, use_fitness)
         event_losses, waits, details = _allocate_events(
-            frame, events, model, cruise, scenario, event_moment.hour, event_moment.dayofweek
+            frame, events, model, cruise, scenario, event_moment, moving, waits
         )
         updated = ds / (cruise / 3.6) + event_losses
         if np.max(abs(updated - moving) / np.maximum(1, moving)) < 0.002:
@@ -145,6 +179,24 @@ def predict_route(
     breaks = personal_break_minutes * 60
     total_time = moving_time + stationary_time + breaks
     uncovered = [e for e in details if not e["stationary_known"]]
+    weather_coverage = float(
+        frame.loc[
+            frame.get("weather_available", pd.Series(False, index=frame.index)).fillna(False),
+            "distance_m",
+        ].sum()
+        / distance
+    )
+    if getattr(model, "neutral_model", None) is not None and weather_coverage < 0.95:
+        warnings.append(
+            f"Weather available for {weather_coverage:.0%} of route distance; missing sections use the fitted weather-neutral terrain model."
+        )
+    if weather_provider is not None:
+        warnings.append(getattr(weather_provider, "note", "ECCC external weather observations"))
+        warnings.extend(sorted(set(weather_provider.client.errors)))
+        if breaks:
+            warnings.append(
+                "Personal breaks are added to the total ledger. Their locations are unspecified, so they do not shift segment weather arrival times."
+            )
     if uncovered:
         warnings.append(
             f"{len(uncovered)} traffic events lack calibrated stationary waits. Elapsed time excludes unknown waits; it may be understated. Full-stop fallback reaches zero speed without inventing dwell time."
@@ -167,7 +219,13 @@ def predict_route(
             "moving_lower_s": distance / (upper / 3.6),
             "moving_upper_s": distance / (lower / 3.6),
             "samples": n,
-            "provisional": n < 20 or unknown_fraction > 0.2 or bool(uncovered),
+            "provisional": n < 20
+            or unknown_fraction > 0.2
+            or bool(uncovered)
+            or weather_provider is not None
+            or (variant == "CW" and weather_coverage < 0.8)
+            or model.validation.get("metrics", {}).get("interval_coverage", 1.0) is None
+            or (model.validation.get("metrics", {}).get("interval_coverage", 1.0) or 0) < 0.9,
             "method": "chronological held-out ride absolute-error calibration",
         }
     if interval is None:
@@ -202,6 +260,9 @@ def predict_route(
         "waits_by_kind": waits_by_kind,
         "scenario": scenario,
         "model_kind": model.kind,
+        "model_variant": variant,
         "iterations": iteration + 1,
         "unknown_wait_events": len(uncovered),
+        "weather_distance_coverage": weather_coverage,
+        "weather_neutral": weather_neutral,
     }

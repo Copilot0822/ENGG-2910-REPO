@@ -86,6 +86,11 @@ def route_events(points):
             merged
             and event["group"] == merged[-1]["group"]
             and event["distance_m"] - merged[-1]["distance_m"] < 55
+            and (
+                event["kind"] == "corner"
+                or merged[-1]["kind"] == "corner"
+                or event["identity"] == merged[-1]["identity"]
+            )
         ):
             previous = merged[-1]
             primary = event if priority[event["kind"]] > priority[previous["kind"]] else previous
@@ -131,9 +136,28 @@ def observe_events(points, events, ride_id):
         if cruise < 1.5:
             continue
         minimum = float(speed.min())
-        stationary = float(subset.stationary_s.sum())
-        reliable = bool(subset.unobserved_s.sum() < 8 and subset.dt_s[subset.dt_s > 0].median() <= 10)
-        if stationary >= 2 and minimum < 0.8:
+        # Moving-threshold time is not proof of reaching zero. Require recorded near-zero
+        # samples close to the control, with consecutive short observation intervals.
+        near = subset[abs(subset.distance_m - event["distance_m"]) <= 35]
+        confirmed_zero = near.speed_mps.le(0.3) & near.dt_s.between(0, 10)
+        stationary = float(near.loc[confirmed_zero, "stationary_s"].sum())
+        reasons = []
+        if subset.unobserved_s.sum() >= 8 or subset.dt_s.max() > 15:
+            reasons.append("recording gap / sparse sampling / auto-pause")
+        if (
+            subset.distance_m.min() > event["distance_m"] - 15
+            or subset.distance_m.max() < event["distance_m"] + 15
+        ):
+            reasons.append("incomplete approach or recovery")
+        if stationary > 180:
+            reasons.append("long dwell may be a personal break")
+        if (
+            event["kind"] != "corner"
+            and float(near.get("map_confidence", pd.Series(1.0, index=near.index)).mean()) < 0.5
+        ):
+            reasons.append("uncertain road match")
+        reliable = not reasons
+        if reliable and stationary >= 2 and confirmed_zero.sum() >= 2:
             behavior = "full_stop"
         elif reliable and minimum < min(2.8, cruise * 0.65):
             behavior = "rolling"
@@ -145,7 +169,13 @@ def observe_events(points, events, ride_id):
         minimum_ix = subset.speed_mps.idxmin()
         minimum_time = points.loc[minimum_ix, "time"]
         before, after = subset.loc[:minimum_ix], subset.loc[minimum_ix:]
-        time_value = subset.time.dropna().iloc[0] if subset.time.notna().any() else pd.NaT
+        sign_ix = int(abs(subset.distance_m - event["distance_m"]).idxmin())
+        time_value = points.loc[sign_ix, "time"]
+        braking = before[before.speed_mps < cruise * 0.85]
+        recovery = after[after.speed_mps >= cruise * 0.85]
+        arrival_heading = float(subset.heading.iloc[0])
+        departure_heading = float(subset.heading.iloc[-1])
+        turn_signed = (departure_heading - arrival_heading + 180) % 360 - 180
         observations.append(
             {
                 **event,
@@ -153,11 +183,28 @@ def observe_events(points, events, ride_id):
                 "approach_mps": approach,
                 "minimum_mps": minimum,
                 "exit_mps": exit_speed,
+                "speed_at_sign_mps": float(points.loc[sign_ix, "speed_mps"]),
+                "braking_distance_m": max(0.0, float(event["distance_m"] - braking.distance_m.iloc[0]))
+                if len(braking)
+                else 0.0,
+                "recovery_distance_m": max(0.0, float(recovery.distance_m.iloc[0] - event["distance_m"]))
+                if len(recovery)
+                else float("nan"),
+                "approach_heading": arrival_heading,
+                "turn_direction": "straight"
+                if abs(turn_signed) < 35
+                else "right"
+                if turn_signed > 0
+                else "left",
                 "braking_s": float(before.moving_s[before.speed_mps < cruise * 0.8].sum()),
                 "acceleration_s": float(after.moving_s[after.speed_mps < cruise * 0.8].sum()),
-                "stationary_s": stationary if reliable or stationary >= 2 else np.nan,
+                "stationary_s": stationary if reliable else np.nan,
                 "moving_loss_s": moving_loss,
                 "reliable": reliable,
+                "reliability_reasons": reasons,
+                "behavior_confidence": float(np.exp(-max(0, subset.dt_s.max() - 1) / 10))
+                if reliable
+                else 0.0,
                 "behavior": behavior,
                 "turning": event["turn_angle"] >= 40,
                 "hour": time_value.hour if pd.notna(time_value) else -1,
@@ -174,6 +221,13 @@ def physics_loss(cruise_mps, minimum_mps, window_m=200.0, decel=0.9, accel=0.45)
     u = max(0, min(float(minimum_mps), v))
     distance = (v * v - u * u) / 2 * (1 / decel + 1 / accel)
     if distance > window_m:
+        if u == 0:
+            # Closely spaced mandatory stops cannot regain the unrestricted cruising
+            # speed between them. Use a triangular profile that still reaches zero;
+            # never relax a full-stop request into a rolling slowdown to fit the window.
+            factor = 1 / decel + 1 / accel
+            peak = np.sqrt(max(0, 2 * window_m / factor))
+            return max(0.0, float(peak * factor - window_m / v))
         # Reduce attainable speed change to fit the finite interruption window.
         u = np.sqrt(max(0, v * v - 2 * window_m / (1 / decel + 1 / accel)))
         distance = window_m
@@ -185,59 +239,172 @@ def physics_loss(cruise_mps, minimum_mps, window_m=200.0, decel=0.9, accel=0.45)
 class BehaviorModel:
     observations: list = field(default_factory=list)
 
+    def pools(self, event, hour, weekday):
+        if not hasattr(self, "_pool_cache"):
+            self._pool_cache, self._kinds, self._identities = {}, {}, {}
+            for observation in self.observations:
+                if observation["reliable"] and observation["behavior"] in (
+                    "full_stop",
+                    "rolling",
+                    "minimal",
+                ):
+                    self._kinds.setdefault(observation["kind"], []).append(observation)
+                    self._identities.setdefault(observation["identity"], []).append(observation)
+        key = self.context_key(event, hour, weekday)
+        if key not in self._pool_cache:
+            usable = self._kinds.get(event["kind"], [])
+            comparable = [
+                o
+                for o in usable
+                if o["highway"] == event["highway"] and o["turning"] == (event["turn_angle"] >= 40)
+            ]
+            terrain = [
+                o
+                for o in comparable
+                if o["surface"] == event["surface"]
+                and abs(o["gradient_pct"] - event["gradient_pct"]) <= 3
+            ]
+            clock = [o for o in terrain if self.clock_similar(o, hour, weekday)]
+            broad = next((pool for pool in (clock, terrain, comparable) if len(pool) >= 12), usable)
+            local_all = [
+                o
+                for o in self._identities.get(event["identity"], [])
+                if o["kind"] == event["kind"]
+                and abs((o.get("approach_heading", o["heading"]) - event["heading"] + 180) % 360 - 180)
+                < 60
+            ]
+            local_clock = [o for o in local_all if self.clock_similar(o, hour, weekday)]
+            local = local_clock if len(local_clock) >= 3 else local_all
+            self._pool_cache[key] = broad, local
+        return self._pool_cache[key]
+
+    @staticmethod
+    def clock_similar(observation, hour, weekday):
+        return (
+            observation["hour"] >= 0
+            and min(abs(observation["hour"] - hour), 24 - abs(observation["hour"] - hour)) <= 3
+            and (observation["weekday"] >= 5) == (weekday >= 5)
+        )
+
+    @staticmethod
+    def context_key(event, hour, weekday):
+        return (
+            event["kind"],
+            event["highway"],
+            event["turn_angle"] >= 40,
+            event["identity"],
+            hour,
+            weekday >= 5,
+            event["surface"],
+            round(event["gradient_pct"] / 3),
+            round(event["heading"] / 45),
+        )
+
+    def historical_summary(self, event, hour, weekday, broad, local):
+        from scipy.stats import beta
+
+        if not hasattr(self, "_summary_cache"):
+            self._summary_cache = {}
+        key = self.context_key(event, hour, weekday)
+        if key not in self._summary_cache:
+            classes = ("full_stop", "rolling", "minimal")
+            prior = np.array([sum(o["behavior"] == b for o in broad) + 0.5 for b in classes])
+            prior /= prior.sum()
+            counts = np.array([sum(o["behavior"] == b for o in local) for b in classes], dtype=float)
+            posterior = counts + 12 * prior
+            probability = posterior / posterior.sum()
+            alpha = len(local) / (len(local) + 12.0)
+
+            def blend(column, pool=None, default=0.0):
+                pool = broad if pool is None else pool
+                global_values = [
+                    o.get(column, np.nan) for o in pool if np.isfinite(o.get(column, np.nan))
+                ]
+                local_values = [
+                    o.get(column, np.nan)
+                    for o in local
+                    if o in pool and np.isfinite(o.get(column, np.nan))
+                ]
+                mean = float(np.mean(global_values)) if global_values else default
+                return (
+                    alpha * (float(np.mean(local_values)) if local_values else mean) + (1 - alpha) * mean
+                )
+
+            losses = [blend("moving_loss_s", [o for o in broad if o["behavior"] == b]) for b in classes]
+            stopped = [
+                o for o in broad if o["behavior"] == "full_stop" and np.isfinite(o["stationary_s"])
+            ]
+            local_stopped = [
+                o for o in local if o["behavior"] == "full_stop" and np.isfinite(o["stationary_s"])
+            ]
+            global_wait = float(np.mean([o["stationary_s"] for o in stopped])) if stopped else 0.0
+            wait_alpha = len(local_stopped) / (len(local_stopped) + 8)
+            conditional_wait = (
+                wait_alpha
+                * (
+                    float(np.mean([o["stationary_s"] for o in local_stopped]))
+                    if local_stopped
+                    else global_wait
+                )
+                + (1 - wait_alpha) * global_wait
+            )
+            self._summary_cache[key] = {
+                "base_loss": float(np.dot(probability, losses)),
+                "approach": max(1.0, blend("approach_mps")),
+                "minimum": blend("minimum_mps"),
+                "probability": float(probability[0]),
+                "probability_interval": beta.ppf(
+                    [0.05, 0.95], posterior[0], posterior[1:].sum()
+                ).tolist(),
+                "wait": float(probability[0] * conditional_wait),
+                "conditional_wait": conditional_wait,
+                "wait_samples": len(stopped),
+                "full_wait": conditional_wait,
+                "full_known": bool(stopped),
+                "behaviors": dict(zip(classes, map(float, probability))),
+            }
+        return self._summary_cache[key]
+
     def predict(self, event, cruise_mps, scenario="full_stop", hour=12, weekday=5):
         kind = event["kind"]
-        usable = [o for o in self.observations if o["kind"] == kind and o["reliable"]]
-        comparable = [
-            o
-            for o in usable
-            if o["highway"] == event["highway"] and o["turning"] == (event["turn_angle"] >= 40)
-        ]
-        broad = comparable if len(comparable) >= 8 else usable
-        local = [
-            o
-            for o in usable
-            if o["identity"] == event["identity"]
-            and abs(o["hour"] - hour) <= 3
-            and (o["weekday"] >= 5) == (weekday >= 5)
-        ]
+        broad, local = self.pools(event, hour, weekday)
         n = len(local)
-        alpha = n / (n + 12.0)
         result = {
             "moving_loss_s": 0.0,
             "stationary_s": 0.0,
             "stop_probability": None,
-            "source": "physics fallback",
+            "source": "generalized physics fallback",
             "encounters": len(broad),
             "local_encounters": n,
             "stationary_known": True,
             "behavior_probabilities": {},
+            "expected_minimum_mps": None,
+            "confidence": "unavailable",
+            "stop_probability_interval": None,
+            "conditional_wait_s": None,
         }
         if broad:
-            global_loss = float(np.median([o["moving_loss_s"] for o in broad]))
-            local_loss = float(np.median([o["moving_loss_s"] for o in local])) if local else global_loss
-            observed_cruise = max(1.0, float(np.median([o["approach_mps"] for o in broad])))
-            result["moving_loss_s"] = (alpha * local_loss + (1 - alpha) * global_loss) * np.clip(
-                cruise_mps / observed_cruise, 0.5, 2
-            )
-            p_global = (sum(o["stationary_s"] >= 2 for o in broad) + 1) / (len(broad) + 2)
-            p_local = (sum(o["stationary_s"] >= 2 for o in local) + 12 * p_global) / (n + 12)
-            stopped = [o["stationary_s"] for o in broad if o["stationary_s"] >= 2]
-            waits = [o["stationary_s"] for o in local if o["stationary_s"] >= 2]
-            global_wait = float(np.mean(stopped)) if stopped else 0.0
-            local_wait = float(np.mean(waits)) if waits else global_wait
-            wait = local_wait * alpha + global_wait * (1 - alpha)
+            summary = self.historical_summary(event, hour, weekday, broad, local)
             result.update(
                 {
-                    "stop_probability": p_local,
-                    "stationary_s": p_local * wait,
-                    "source": "smoothed historical distribution",
+                    "moving_loss_s": summary["base_loss"]
+                    * np.clip(cruise_mps / summary["approach"], 0.5, 2),
+                    "stop_probability": summary["probability"],
+                    "stationary_s": summary["wait"],
+                    "behavior_probabilities": summary["behaviors"].copy(),
+                    "expected_minimum_mps": float(
+                        np.clip(summary["minimum"] * cruise_mps / summary["approach"], 0, cruise_mps)
+                    ),
+                    "conditional_wait_s": summary["conditional_wait"],
+                    "stop_probability_interval": summary["probability_interval"],
+                    "confidence": "moderate" if n >= 8 else "low",
+                    "source": "location-specific smoothed history"
+                    if n >= 3
+                    else "generalized historical distribution",
+                    "stationary_known": kind not in ("signal", "railway", "stop")
+                    or summary["wait_samples"] > 0,
                 }
             )
-            result["behavior_probabilities"] = {
-                b: (sum(o["behavior"] == b for o in broad) + 1) / (len(broad) + 3)
-                for b in ("full_stop", "rolling", "minimal")
-            }
         else:
             lateral_accel = 0.9 if event["surface"] in ("loose_gravel", "rough_natural") else 1.5
             corner_speed = np.sqrt(max(3, event["radius_m"]) * lateral_accel)
@@ -258,13 +425,11 @@ class BehaviorModel:
                 cruise_mps, corner_speed, event["end_m"] - event["start_m"]
             )
         if kind == "stop" and scenario == "full_stop":
-            full_observed = [o for o in broad if o["behavior"] == "full_stop"]
-            # A stop means reaching zero; dwell is learned only if full-stop recordings exist.
-            result["stationary_s"] = (
-                float(np.median([o["stationary_s"] for o in full_observed])) if full_observed else 0.0
-            )
-            result["stationary_known"] = bool(full_observed)
+            summary = self.historical_summary(event, hour, weekday, broad, local) if broad else {}
+            result["stationary_s"] = summary.get("full_wait", 0.0)
+            result["stationary_known"] = summary.get("full_known", False)
             result["stop_probability"] = 1.0
+            result["expected_minimum_mps"] = 0.0
             result["moving_loss_s"] = max(
                 result["moving_loss_s"], physics_loss(cruise_mps, 0, event["end_m"] - event["start_m"])
             )

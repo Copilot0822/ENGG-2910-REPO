@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .config import Settings
 from .model import load_model
-from .pipeline import import_archive, prepare_route, process_history, train
+from .pipeline import import_archive, prepare_route, process_history, route_for_model, train
 from .prediction import predict_route
 from .storage import Store
 
@@ -24,15 +24,44 @@ def main():
     trainer.add_argument("--no-validation", action="store_true")
     trainer.add_argument("--optimize-half-life", action="store_true")
     trainer.add_argument("--validation-rides", type=int)
+    trainer.add_argument(
+        "--enrich-weather", action="store_true", help="Retrieve/reuse ECCC weather before fitting"
+    )
     predictor = sub.add_parser("predict", help="Predict a GPX without the web interface")
     predictor.add_argument("gpx")
     predictor.add_argument("--hr", type=float)
     predictor.add_argument("--bike")
+    predictor.add_argument(
+        "--model-variant",
+        choices=["A", "B", "C", "CW"],
+        help="Retained variant; default is traffic-aware C + Weather when trained",
+    )
     predictor.add_argument("--scenario", choices=["full_stop", "observed"], default="full_stop")
     predictor.add_argument("--break-minutes", type=float, default=0)
     predictor.add_argument("--output", help="Write private segment predictions to CSV")
+    predictor.add_argument("--departure", help="Planned ISO timestamp with timezone")
+    predictor.add_argument(
+        "--forecast", action="store_true", help="Use cached/bounded ECCC City Page hourly forecasts"
+    )
+    predictor.add_argument("--weather-neutral", action="store_true")
     sub.add_parser("status", help="Show local dataset and trained model status")
     sub.add_parser("config", help="Show effective configuration")
+    weather = sub.add_parser("weather", help="Cache ECCC historical observations and enrich segments")
+    weather.add_argument("action", choices=["enrich", "report"])
+    weather.add_argument(
+        "--retry", action="store_true", help="Retry missing coverage using cached successful requests"
+    )
+    weather.add_argument("--refresh", action="store_true", help="Explicitly refresh ECCC records")
+    weather.add_argument("--offline", action="store_true")
+    osm = sub.add_parser("osm", help="Manage public extracts and local indexes")
+    osm.add_argument("action", choices=["download", "index", "report", "regions"])
+    osm.add_argument(
+        "--regions", nargs="+", default=["ontario", "quebec", "new-brunswick", "prince-edward-island"]
+    )
+    compare = sub.add_parser(
+        "compare", help="Paired chronological comparisons; retain the traffic-aware C default"
+    )
+    compare.add_argument("--validation-rides", type=int)
     args = parser.parse_args()
     settings = Settings.load()
     if args.data_dir:
@@ -56,10 +85,78 @@ def main():
             store.set_state("last_import", report)
         elif args.command == "process":
             summary = process_history(store, settings, progress, args.refresh_osm)
+        elif args.command == "weather":
+            from .weather import enrich_history, weather_report
+
+            settings.weather_offline = args.offline or settings.weather_offline
+            summary = (
+                enrich_history(store, settings, progress, args.refresh)
+                if args.action == "enrich"
+                else weather_report(store)
+            )
+        elif args.command == "osm":
+            from .network import NetworkIndex, download_region, source_paths
+            from .coverage import history_coverage
+
+            if args.action == "download":
+                summary = {
+                    "files": [str(download_region(store.root, r, progress)) for r in args.regions]
+                }
+            elif args.action == "index":
+                summary = {
+                    "sources": NetworkIndex(
+                        store.root, source_paths(settings, store.root), progress
+                    ).report()
+                }
+                store.set_state("osm_sources", summary["sources"])
+            elif args.action == "report":
+                summary = history_coverage(store)
+                store.set_state("osm_coverage", summary)
+            else:
+                import numpy as np
+                import pandas as pd
+
+                cells = []
+                for ride in store.rides().itertuples():
+                    p = store.points(ride.id)
+                    cells.append(
+                        pd.DataFrame(
+                            {
+                                "lat_degree": np.floor(p.lat),
+                                "lon_degree": np.floor(p.lon),
+                                "km": p.ds_m / 1000,
+                            }
+                        )
+                    )
+                summary = (
+                    pd.concat(cells)
+                    .groupby(["lat_degree", "lon_degree"])
+                    .km.sum()
+                    .sort_values(ascending=False)
+                    .reset_index()
+                    .to_dict("records")
+                    if cells
+                    else []
+                )
+        elif args.command == "compare":
+            from .comparison import compare_models
+
+            if args.validation_rides:
+                settings.validation_rides = args.validation_rides
+            summary = compare_models(store, settings, progress)
+            summary = {
+                k: v
+                for k, v in summary.items()
+                if k not in ("rows", "paired_rows", "selection_rows", "candidates", "groups")
+            }
         elif args.command == "train":
             settings.optimize_half_life = args.optimize_half_life or settings.optimize_half_life
             if args.validation_rides:
                 settings.validation_rides = args.validation_rides
+            if args.enrich_weather:
+                from .weather import enrich_history
+
+                enrich_history(store, settings, progress)
             model = train(store, settings, progress, validate=not args.no_validation)
             summary = {
                 "kind": model.kind,
@@ -72,16 +169,36 @@ def main():
             model = load_model(store)
             if model is None:
                 raise ValueError("Train a model first.")
+            requested_variant = args.model_variant
+            candidate_path = store.root / "models" / f"model-{requested_variant}.joblib"
+            if requested_variant and candidate_path.exists():
+                import joblib
+
+                model = joblib.load(candidate_path)
+            if args.scenario == "full_stop" and getattr(model, "variant", "C") in ("A", "B"):
+                raise ValueError(
+                    "Full-stop mapped traffic predictions require model C. Use --model-variant C or --scenario observed for the rolling baseline."
+                )
             route = prepare_route(Path(args.gpx).read_bytes(), args.gpx, store, settings)
+            route_segments, route_controls = route_for_model(route, model)
+            forecast = None
+            if args.forecast and not args.weather_neutral:
+                from .forecast import CityForecast
+
+                forecast = CityForecast(store.root, settings)
+                forecast.prepare(route_segments)
             result = predict_route(
                 model,
-                route["segments"],
-                route["events"],
+                route_segments,
+                route_controls,
                 args.hr,
                 args.bike,
                 args.scenario,
                 args.break_minutes,
+                departure=args.departure,
                 use_fitness=model.validation.get("fitness_selected", False),
+                weather_provider=forecast,
+                weather_neutral=args.weather_neutral,
             )
             summary = {k: v for k, v in result.items() if k not in ("segments", "surfaces", "events")}
             summary["warnings"] += route["warnings"]

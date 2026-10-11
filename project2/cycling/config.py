@@ -24,8 +24,17 @@ class Settings:
     osm_min_interval_s: float = 3.0
     osm_cache_days: int = 180
     local_osm_path: str = ""
+    local_osm_paths: list[str] | None = None
     valhalla_url: str = ""
     map_match_radius_m: float = 40.0
+    osm_workers: int = 3
+    comparison_workers: int = 3
+    weather_enabled: bool = True
+    weather_offline: bool = False
+    weather_radius_km: float = 65.0
+    weather_candidates: int = 4
+    weather_min_interval_s: float = 1.0
+    weather_max_requests: int = 700
     max_archive_bytes: int = 2_000_000_000
     max_uncompressed_bytes: int = 8_000_000_000
     max_entry_bytes: int = 128_000_000

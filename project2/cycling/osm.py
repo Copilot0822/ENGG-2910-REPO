@@ -1,6 +1,5 @@
 """Cached OSM enrichment. Geometry is annotated, never silently rerouted."""
 
-from collections import defaultdict
 import gzip
 import json
 import math
@@ -9,12 +8,8 @@ import time
 import zlib
 
 from defusedxml import ElementTree as ET
-import numpy as np
 import requests
-from shapely.geometry import LineString, Point
-from shapely.strtree import STRtree
 
-from .geometry import angle_difference, bearing, haversine
 
 SURFACES = {
     "paved": {
@@ -90,7 +85,7 @@ def control_applies(tags, forward, member=True, junction_shared=False):
 
 
 def read_local_osm(path):
-    """OSM XML/Overpass JSON; optional pyosmium reads local PBF without Docker."""
+    """Small XML/JSON/PBF fixtures; the bulk provider streams PBF through NetworkIndex."""
     path = Path(path).expanduser().resolve()
     if path.suffix.lower() == ".json":
         return json.loads(path.read_text(encoding="utf-8"))
@@ -175,6 +170,7 @@ class OSMProvider:
         self.local = None
         self.loaded_tiles = {}
         self.unavailable = set()
+        self.network = None
 
     def _tile(self, a, b):
         size = self.settings.osm_tile_degrees
@@ -235,13 +231,17 @@ class OSMProvider:
 
     def data_for(self, points):
         if self.settings.osm_provider == "local":
-            if self.local is None:
+            if self.network is None:
                 try:
-                    self.local = read_local_osm(self.settings.local_osm_path)
+                    from .network import NetworkIndex, source_paths
+
+                    self.network = NetworkIndex(
+                        self.store.root, source_paths(self.settings, self.store.root)
+                    )
                 except (OSError, ValueError, ET.ParseError) as exc:
                     self.warnings.add(f"Local OSM load failed: {exc}")
-                    self.local = {"elements": []}
-            return self.local
+                    return {"elements": []}
+            return self.network.data_for(points)
         size = self.settings.osm_tile_degrees
         # Add immediate neighboring cells near borders, without downloading a whole ride bounding box.
         tiles = set()
@@ -265,14 +265,44 @@ class OSMProvider:
 
     def annotate(self, points):
         payload = self.data_for(points)
-        result = annotate_network(points, payload, self.settings.map_match_radius_m)
+        from .matching import annotate_hmm
+
+        result = annotate_hmm(
+            points, payload, self.settings.map_match_radius_m, self.store.root / "osm" / "graphs"
+        )
         if self.settings.valhalla_url:
-            result = self._valhalla(result, payload)
+            from urllib.parse import urlparse
+
+            if urlparse(self.settings.valhalla_url).hostname not in ("localhost", "127.0.0.1", "::1"):
+                self.warnings.add("Remote trace matching disabled: use a local Valhalla endpoint.")
+            else:
+                result = self._valhalla(result, payload)
         if not result.map_confidence.gt(0).any():
             self.warnings.add(
                 "No OSM roads matched. Geometry retained; surfaces and traffic controls remain unknown."
             )
         return result
+
+    def signature(self, points=None):
+        from .matching import MATCH_VERSION
+
+        if self.settings.osm_provider == "local":
+            if self.network is None:
+                from .network import NetworkIndex, source_paths
+
+                try:
+                    self.network = NetworkIndex(
+                        self.store.root, source_paths(self.settings, self.store.root)
+                    )
+                except (OSError, ValueError) as exc:
+                    self.warnings.add(f"Local OSM unavailable: {exc}")
+                    return f"{MATCH_VERSION}:missing:{self.settings.local_osm_path}"
+            source = self.network.signature(points)
+        else:
+            with self.store.connect() as db:
+                revisions = db.execute("SELECT key,fetched_at FROM osm_tiles ORDER BY key").fetchall()
+            source = f"{self.settings.osm_provider}:{self.settings.overpass_url}:{self.settings.osm_cache_days}:{revisions}"
+        return f"{MATCH_VERSION}:{self.settings.map_match_radius_m}:{source}"
 
     def _valhalla(self, points, payload):
         # Request annotations, not a replacement route. Default configuration never sends traces externally.
@@ -334,152 +364,7 @@ class OSMProvider:
 
 
 def annotate_network(points, payload, radius=40.0):
-    result = points.copy()
-    defaults = {
-        "surface": "unknown",
-        "surface_source": "unknown",
-        "surface_confidence": 0.0,
-        "surface_raw": "",
-        "smoothness": "",
-        "tracktype": "",
-        "highway": "unknown",
-        "bicycle": "",
-        "junction": "",
-        "way_id": "",
-        "map_confidence": 0.0,
-        "map_distance_m": np.nan,
-        "forward": True,
-        "osm_tags": "{}",
-        "control_kind": "",
-        "control_id": "",
-        "control_uncertain": False,
-    }
-    for key, value in defaults.items():
-        result[key] = value
-    elements = payload.get("elements", [])
-    nodes = {e["id"]: e for e in elements if e["type"] == "node"}
-    roads = [e for e in elements if e["type"] == "way" and "highway" in e.get("tags", {})]
-    if not roads:
-        return result
-    lat0, lon0 = float(points.lat.mean()), float(points.lon.mean())
-    scale_x, scale_y = 111195 * np.cos(np.radians(lat0)), 111195.0
+    """Local directed HMM matching, with unchanged recorded GPS geometry."""
+    from .matching import annotate_hmm
 
-    def xy(lat, lon):
-        return ((lon - lon0) * scale_x, (lat - lat0) * scale_y)
-
-    lines, properties = [], []
-    membership = defaultdict(set)
-    for road in roads:
-        ids = road.get("nodes", [])
-        geometry = road.get("geometry") or [nodes[n] for n in ids if n in nodes]
-        for n in ids:
-            membership[n].add(str(road["id"]))
-        for a, b in zip(geometry[:-1], geometry[1:]):
-            line = LineString([xy(a["lat"], a["lon"]), xy(b["lat"], b["lon"])])
-            if line.length < 0.1:
-                continue
-            lines.append(line)
-            properties.append((road, float(bearing(a["lat"], a["lon"], b["lat"], b["lon"]))))
-    if not lines:
-        return result
-    tree = STRtree(lines)
-    previous_way = None
-    for row in result.itertuples():
-        point = Point(xy(row.lat, row.lon))
-        candidates = tree.query(point.buffer(radius))
-        if not len(candidates):
-            previous_way = None
-            continue
-        scored = []
-        for candidate in candidates:
-            road, heading = properties[candidate]
-            distance = lines[candidate].distance(point)
-            diff = abs(float(angle_difference(row.heading, heading)))
-            forward = diff <= 90
-            parallel_diff = min(diff, 180 - diff)
-            score = (
-                distance
-                + parallel_diff * 0.18
-                + (3 if previous_way and str(road["id"]) != previous_way else 0)
-            )
-            oneway = road["tags"].get("oneway:bicycle", road["tags"].get("oneway", ""))
-            if oneway in ("yes", "1") and not forward or oneway == "-1" and forward:
-                score += 18
-            scored.append((score, candidate, distance, forward, parallel_diff))
-        scored.sort(key=lambda v: v[0])
-        score, selected, distance, forward, diff = scored[0]
-        road, _ = properties[selected]
-        if distance > radius or diff > 70:
-            continue
-        tags = road["tags"]
-        surface, source, confidence = classify_surface(tags)
-        map_confidence = max(0.05, 1 - distance / radius) * max(0.2, 1 - diff / 90)
-        if (
-            len(scored) > 1
-            and scored[1][0] - score < 3
-            and properties[scored[1][1]][0]["id"] != road["id"]
-        ):
-            map_confidence *= 0.6
-        ix = row.Index
-        updates = {
-            "surface": surface,
-            "surface_source": source,
-            "surface_confidence": confidence,
-            "surface_raw": tags.get("surface", ""),
-            "highway": tags.get("highway", "unknown"),
-            "smoothness": tags.get("smoothness", ""),
-            "tracktype": tags.get("tracktype", ""),
-            "bicycle": tags.get("bicycle", ""),
-            "junction": tags.get("junction", ""),
-            "way_id": str(road["id"]),
-            "map_confidence": map_confidence,
-            "map_distance_m": distance,
-            "forward": forward,
-            "osm_tags": json.dumps(tags),
-        }
-        for key, value in updates.items():
-            result.at[ix, key] = value
-        previous_way = str(road["id"])
-    # Only controls on the actual matched way can affect it. Spatial proximity alone is insufficient.
-    controls = [n for n in nodes.values() if control_kind(n.get("tags", {}))]
-    seen = {}
-    for node in controls:
-        member_ways = membership[node["id"]]
-        eligible = result.way_id.isin(member_ways) & result.map_confidence.ge(0.25)
-        if not eligible.any():
-            continue
-        distances = haversine(result.lat, result.lon, node["lat"], node["lon"])
-        indices = np.flatnonzero(eligible.to_numpy() & (distances < 22))
-        # Each traversal gets one encounter, even if repeated points sit beside the same sign.
-        traversals = []
-        for ix in indices:
-            if (
-                not traversals
-                or result.distance_m.iloc[ix] - result.distance_m.iloc[traversals[-1][-1]] > 90
-            ):
-                traversals.append([ix])
-            else:
-                traversals[-1].append(ix)
-        for group in traversals:
-            ix = min(group, key=lambda i: distances[i])
-            applies, reason = control_applies(
-                node.get("tags", {}), bool(result.forward.iloc[ix]), True, len(member_ways) > 1
-            )
-            if applies is False:
-                continue
-            if applies is None:
-                result.at[ix, "control_uncertain"] = True
-                continue
-            key = (node["id"], bool(result.forward.iloc[ix]))
-            if key in seen and result.distance_m.iloc[ix] - seen[key] < 90:
-                continue
-            # Multiple co-located signal/stop nodes are consolidated to avoid charging twice.
-            nearby = result.control_kind.ne("") & (
-                abs(result.distance_m - result.distance_m.iloc[ix]) < 35
-            )
-            if nearby.any():
-                continue
-            result.at[ix, "control_kind"] = control_kind(node["tags"])
-            result.at[ix, "control_id"] = f"{node['id']}:{'f' if result.forward.iloc[ix] else 'b'}"
-            seen[key] = result.distance_m.iloc[ix]
-    return result
+    return annotate_hmm(points, payload, radius)

@@ -1,8 +1,6 @@
 """Local Streamlit workflow and route visualization."""
 
-from dataclasses import asdict
 from datetime import datetime, time
-import hashlib
 import json
 from zoneinfo import ZoneInfo
 
@@ -15,7 +13,7 @@ import streamlit as st
 from .config import Settings
 from .importer import impute_ride_hr
 from .model import load_model
-from .pipeline import import_archive, prepare_route, process_history, train
+from .pipeline import import_archive, prepare_route, process_history, route_for_model, train
 from .prediction import predict_route
 from .storage import Store
 
@@ -33,6 +31,11 @@ def duration(seconds):
     return f"{minutes // 60}h {minutes % 60:02d}m"
 
 
+def behavior_label(event, key, label):
+    probabilities = event.get("behavior_probabilities") or {}
+    return f"{label}: {probabilities[key]:.0%}" if key in probabilities else f"{label}: unavailable"
+
+
 def settings_panel(settings):
     with st.sidebar.expander("Data, OSM and training settings"):
         provider = st.selectbox(
@@ -41,20 +44,28 @@ def settings_panel(settings):
             index=["offline", "overpass", "local"].index(settings.osm_provider),
         )
         st.caption(
-            "Offline uses cached OSM or unknown labels. Overpass sends coarse road-area queries; the ZIP and recordings stay local."
+            "Local uses persistent regional indexes. Offline uses cached lookups. Overpass is for small routes; bulk history requires local extracts."
         )
         endpoint = st.text_input("Overpass endpoint", settings.overpass_url)
         local = st.text_input("Local .osm / .osm.gz / .json / .pbf path", settings.local_osm_path)
+        locals_text = st.text_area(
+            "Additional extract paths (one per line)", "\n".join(settings.local_osm_paths or [])
+        )
+        st.caption(
+            "Leave paths empty to use data/osm/extracts/*.osm.pbf. New regions need a public extract downloaded locally."
+        )
         tiles = st.number_input("Maximum new OSM tiles per batch", 1, 100, settings.osm_max_tiles)
         valhalla = st.text_input(
             "Optional Valhalla URL",
             settings.valhalla_url,
-            help="Use a local service such as http://127.0.0.1:8002. Enabling a remote URL sends route coordinates to that provider.",
+            help="Only local endpoints such as http://127.0.0.1:8002 are permitted. The built-in HMM needs no service.",
         )
         half_life = st.number_input("Recency half-life (days)", 15, 1000, int(settings.half_life_days))
         optimize = st.checkbox("Select half-life by earlier-only backtests", settings.optimize_half_life)
         validation = st.number_input("Chronological test rides", 3, 60, settings.validation_rides)
         ebikes = st.checkbox("Include outdoor e-bike rides", settings.include_ebikes)
+        weather_enabled = st.checkbox("Enrich ECCC weather before UI training", settings.weather_enabled)
+        weather_offline = st.checkbox("Use only cached ECCC data", settings.weather_offline)
         if st.button("Save settings", width="stretch"):
             settings.osm_provider, settings.overpass_url, settings.local_osm_path = (
                 provider,
@@ -62,8 +73,12 @@ def settings_panel(settings):
                 local,
             )
             settings.osm_max_tiles, settings.valhalla_url = int(tiles), valhalla
+            settings.local_osm_paths = [
+                p.strip().strip('"') for p in locals_text.splitlines() if p.strip()
+            ]
             settings.half_life_days, settings.optimize_half_life = half_life, optimize
             settings.validation_rides, settings.include_ebikes = int(validation), ebikes
+            settings.weather_enabled, settings.weather_offline = weather_enabled, weather_offline
             settings.save()
             st.success("Saved. Refresh OSM processing or retrain to apply changes to historical data.")
             st.rerun()
@@ -85,6 +100,7 @@ def _run_progress(function):
 
 
 def historical_page(store, settings):
+    settings.weather_offline = st.session_state.get("weather-cache-only", settings.weather_offline)
     st.title("Historical data")
     st.write("Import your Strava export, inspect the recordings, then train a model of your riding.")
     rides = store.rides()
@@ -152,6 +168,10 @@ def historical_page(store, settings):
         if b.button("Train / retrain model", disabled=len(rides) == 0, type="primary", width="stretch"):
             try:
                 _run_progress(lambda p: process_history(store, settings, p, refresh))
+                if settings.weather_enabled:
+                    from .weather import enrich_history
+
+                    _run_progress(lambda p: enrich_history(store, settings, p))
                 model = _run_progress(lambda p: train(store, settings, p, run_validation))
                 st.success(f"Trained {model.kind}. Selected half-life: {model.half_life:g} days.")
             except Exception as exc:
@@ -166,6 +186,8 @@ def historical_page(store, settings):
         for warning in store.get_state("osm_warnings", []):
             st.warning(warning)
     if len(rides):
+        weather_dashboard(store, settings, rides)
+        osm_dashboard(store, rides)
         table = rides.copy()
         table["distance_km"] = table.distance_m / 1000
         table["moving_hours"] = table.moving_s / 3600
@@ -191,6 +213,273 @@ def historical_page(store, settings):
         st.dataframe(table[columns], hide_index=True, width="stretch")
 
 
+def weather_dashboard(store, settings, rides):
+    from .weather import enrich_history
+    from .traffic import refresh_behavior
+
+    with st.container(border=True):
+        st.subheader("ECCC weather and observed traffic behavior")
+        report = store.get_state("weather_coverage", {})
+        a, b, c = st.columns(3)
+        a.metric("Rides with ECCC wind", f"{report.get('rides', 0)} / {len(rides)}")
+        b.metric("Segments with weather", f"{report.get('segment_coverage', 0):.1%}")
+        c.metric("Stations used", report.get("stations", 0))
+        st.caption(
+            "Station winds are usually measured at 10 m. They describe regional conditions; shelter and cyclist-height wind differ. Requests contain station IDs and time ranges, never complete traces."
+        )
+        offline = st.checkbox(
+            "Weather enrichment cache only (offline)", settings.weather_offline, key="weather-cache-only"
+        )
+        settings.weather_offline = offline
+        if st.button("Enrich / retry missing ECCC weather"):
+            try:
+                _run_progress(lambda p: enrich_history(store, settings, p))
+                st.rerun()
+            except Exception as exc:
+                st.error(
+                    f"Weather enrichment failed: {exc}. Cached weather and neutral predictions remain usable."
+                )
+        if st.button("Reanalyse stop-sign and signal speed traces"):
+            _run_progress(lambda p: refresh_behavior(store, p))
+            st.rerun()
+        with st.expander("Weather coverage, missing values and station metadata"):
+            st.json(report)
+            path = store.root / "weather" / "stations.json"
+            if path.exists():
+                stations = pd.DataFrame(json.loads(path.read_text(encoding="utf-8")))
+                st.dataframe(
+                    stations[stations.id.isin(report.get("station_ids", []))],
+                    hide_index=True,
+                    width="stretch",
+                )
+        behavior = store.get_state("traffic_behavior", {})
+        if behavior:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "kind": k,
+                            **v,
+                            "full_stop_percent": 100 * (v["fractions"]["full_stop"] or 0),
+                            "rolling_percent": 100 * (v["fractions"]["rolling"] or 0),
+                            "minimal_percent": 100 * (v["fractions"]["minimal"] or 0),
+                        }
+                        for k, v in behavior["kinds"].items()
+                        if k in ("stop", "signal")
+                    ]
+                ).drop(columns=["counts", "fractions"]),
+                hide_index=True,
+                width="stretch",
+            )
+            st.caption(behavior["note"])
+
+
+def osm_dashboard(store, rides):
+    st.subheader("OSM enrichment and data quality")
+    report = store.get_state("osm_coverage")
+    with st.expander("Public extracts and indexed regions"):
+        st.caption(
+            "Province downloads contain public OSM data. No recorded GPS traces are uploaded. Current maps may differ from roads on historical ride dates."
+        )
+        sources = store.get_state("osm_sources", [])
+        if sources:
+            st.dataframe(
+                pd.DataFrame(sources)[["source", "ways", "controls", "indexed_at", "sha256"]],
+                hide_index=True,
+                width="stretch",
+            )
+        from .network import REGIONS, NetworkIndex, download_region, source_paths
+
+        regions = st.multiselect("Extracts to download", list(REGIONS), default=["ontario"])
+        if st.button("Download missing regional extracts", disabled=not regions):
+            try:
+                _run_progress(lambda p: [download_region(store.root, r, p) for r in regions])
+                st.success("Extracts downloaded locally. Build the index, then process history.")
+            except Exception as exc:
+                st.error(f"Download failed: {exc}")
+        if st.button("Build / update local road indexes"):
+            try:
+                index = _run_progress(
+                    lambda p: NetworkIndex(store.root, source_paths(Settings.load(), store.root), p)
+                )
+                store.set_state("osm_sources", index.report())
+                st.success(
+                    "Persistent spatial indexes are ready. Set OSM source to local and process history."
+                )
+            except Exception as exc:
+                st.error(f"Index failed: {exc}")
+    if report:
+        a, b, c, d = st.columns(4)
+        a.metric(
+            "Road-matched distance",
+            f"{report['matched_km']:,.1f} km",
+            f"{report['matched_percent']:.1f}% of history",
+        )
+        b.metric("High confidence / matched", f"{report['high_confidence_percent_of_matched']:.1f}%")
+        c.metric("Analyzed encounters", f"{report['analyzed_encounters']:,}")
+        d.metric("Reliable traffic encounters", f"{report['reliable_traffic_encounters']:,}")
+        left, right = st.columns(2)
+        left.dataframe(pd.DataFrame(report["surfaces"]), hide_index=True, width="stretch")
+        right.dataframe(pd.DataFrame(report["surface_provenance"]), hide_index=True, width="stretch")
+        st.caption(
+            f"Distance weighting uses represented GPS distance, not sample counts. Confirmed matches require confidence ≥0.50; high confidence ≥0.75. Ambiguous matches retain raw tags for inspection but receive unknown model labels. {report['uncertain_controls']:,} uncertain approach detections are excluded."
+        )
+        if "high_confidence_segment_percent" in report:
+            st.caption(
+                f"{report['high_confidence_segment_percent']:.1f}% of {report['matched_segments']:,} matched adaptive segments have high-confidence road identification. Observed stop behavior (reliable encounters): {report.get('stop_behaviors', {})}."
+            )
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "kind": k,
+                        "encounters": count,
+                        "unique_directional_controls": report["unique_directional_controls"].get(k, 0),
+                    }
+                    for k, count in report["control_encounters"].items()
+                ]
+            ),
+            hide_index=True,
+            width="stretch",
+        )
+        with st.expander("Unmatched and low-confidence regions"):
+            st.dataframe(pd.DataFrame(report["weak_regions"]), hide_index=True, width="stretch")
+            cells = [
+                {
+                    "position": [row["longitude_cell"] + 0.05, row["latitude_cell"] + 0.05],
+                    "km": round(row["unmatched_km"], 1),
+                    "radius": max(1000, np.sqrt(row["unmatched_km"]) * 250),
+                }
+                for row in report["weak_regions"]
+            ]
+            if cells:
+                st.pydeck_chart(
+                    pdk.Deck(
+                        layers=[
+                            pdk.Layer(
+                                "ScatterplotLayer",
+                                cells,
+                                get_position="position",
+                                get_radius="radius",
+                                get_fill_color=[225, 115, 35, 150],
+                                pickable=True,
+                            )
+                        ],
+                        map_style=None,
+                        initial_view_state=pdk.ViewState(
+                            latitude=cells[0]["position"][1], longitude=cells[0]["position"][0], zoom=7
+                        ),
+                        tooltip={"text": "{km} km unmatched / low confidence in this 0.1° cell"},
+                    ),
+                    height=300,
+                )
+                st.caption(
+                    "Regional overview of weak road identification. Use the inspector below to see original GPS sections and unknown surfaces."
+                )
+    else:
+        st.info("Process historical recordings to measure actual OSM coverage.")
+    with st.expander("Inspect recorded GPS and selected OSM roads"):
+        if st.checkbox("Open local map-matching inspector"):
+            if st.button("Choose a random activity"):
+                st.session_state.inspection_ride = str(rides.sample(1).id.iloc[0])
+            identifiers = rides.id.astype(str).tolist()
+            selected = st.selectbox(
+                "Recorded activity",
+                identifiers,
+                index=identifiers.index(st.session_state.get("inspection_ride", identifiers[0])),
+                format_func=lambda value: (
+                    f"{rides.loc[rides.id.astype(str).eq(value), 'date'].iloc[0][:10]} · {value}"
+                ),
+            )
+            matching_inspector(store.points(selected))
+
+
+def matching_inspector(points):
+    if "matched_geometry" not in points:
+        st.info("This trace has not been processed with the new matcher.")
+        return
+    total = float(points.distance_m.max() / 1000)
+    start = st.number_input("Inspection start (km)", 0.0, max(0.01, total), 0.0, step=0.5)
+    span = st.number_input("Inspection length (km)", 0.1, 20.0, 2.0, step=0.5)
+    sample = points[points.distance_m.between(start * 1000, (start + span) * 1000)]
+    if len(sample) < 2:
+        st.info("Choose a section with at least two recorded points.")
+        return
+    paths = []
+    for _, section in sample.groupby("group"):
+        paths.append(
+            {
+                "path": section[["lon", "lat"]].to_numpy().tolist(),
+                "color": [205, 65, 145],
+                "detail": "Original GPS",
+            }
+        )
+    roads = [
+        {
+            "path": json.loads(row.matched_geometry),
+            "color": [40, 115, 220],
+            "detail": f"Way {row.way_id} · {row.surface_raw or 'untagged'} · confidence {row.map_confidence:.2f}",
+        }
+        for row in sample[sample.matched_geometry.ne("[]")]
+        .drop_duplicates("matched_geometry")
+        .itertuples()
+    ]
+    weak = [
+        {"position": [r.lon, r.lat], "color": [235, 135, 30], "detail": r.match_status}
+        for r in sample[sample.map_confidence.lt(0.5) | sample.surface.eq("unknown")].itertuples()
+    ]
+    layers = [
+        pdk.Layer(
+            "PathLayer", paths, get_path="path", get_color="color", width_min_pixels=3, pickable=True
+        ),
+        pdk.Layer(
+            "PathLayer", roads, get_path="path", get_color="color", width_min_pixels=2, pickable=True
+        ),
+        pdk.Layer(
+            "ScatterplotLayer",
+            weak,
+            get_position="position",
+            get_fill_color="color",
+            radius_min_pixels=3,
+            get_radius=2,
+            pickable=True,
+        ),
+    ]
+    st.pydeck_chart(
+        pdk.Deck(
+            layers=layers,
+            map_style=None,
+            initial_view_state=pdk.ViewState(
+                latitude=float(sample.lat.mean()), longitude=float(sample.lon.mean()), zoom=14
+            ),
+            tooltip={"text": "{detail}"},
+        ),
+        height=460,
+    )
+    st.caption(
+        "Pink: original GPS · blue: selected OSM edge geometry · orange: uncertain identification or unknown surface. No basemap requests. Spatial proximity is not independently surveyed ground truth."
+    )
+    columns = [
+        c
+        for c in (
+            "distance_m",
+            "way_id",
+            "edge_id",
+            "forward",
+            "map_confidence",
+            "map_distance_m",
+            "surface",
+            "surface_raw",
+            "highway",
+            "osm_tags",
+            "control_kind",
+            "control_id",
+        )
+        if c in sample
+    ]
+    st.dataframe(sample[columns].iloc[:: max(1, len(sample) // 500)], hide_index=True, width="stretch")
+
+
 def prediction_page(store, settings, model):
     st.title("Route prediction")
     if model is None:
@@ -199,6 +488,28 @@ def prediction_page(store, settings, model):
     if store.get_state("model_stale", False):
         st.warning(
             "Historical data changed after training. Retrain for the latest rides and OSM annotations."
+        )
+    if (store.root / "models" / "model-C.joblib").exists():
+        import joblib
+
+        choices = [
+            v for v in ("CW", "C", "B", "A") if (store.root / "models" / f"model-{v}.joblib").exists()
+        ]
+        variant = st.selectbox(
+            "Prediction model",
+            choices,
+            format_func=lambda v: {
+                "A": "A · Geometry baseline",
+                "B": "B · Surface and road",
+                "C": "C · Surface and mapped traffic controls",
+                "CW": "C + Weather · Surface, mapped traffic and ECCC weather (default)",
+            }[v],
+        )
+        if variant != getattr(model, "variant", "C"):
+            model = joblib.load(store.root / "models" / f"model-{variant}.joblib")
+    if getattr(model, "variant", "C") not in ("C", "CW"):
+        st.info(
+            "This variant estimates rolling movement with geometry corners. Select model C for mapped traffic waits and the full-stop traffic-control scenario."
         )
     upload = st.file_uploader("Planned Komoot / GPX route", type=["gpx"])
     with st.expander("Optional elevation correction"):
@@ -222,7 +533,12 @@ def prediction_page(store, settings, model):
         )
     bikes = ["Any / unknown"] + model.support["bikes"]
     bike = right.selectbox("Bike", bikes)
-    scenario = right.selectbox("Stop-sign scenario", ["Full stops", "Observed historical behavior"])
+    scenario = right.selectbox(
+        "Stop-sign scenario",
+        ["Full stops", "Observed historical behavior"]
+        if getattr(model, "variant", "C") in ("C", "CW")
+        else ["Rolling baseline; mapped traffic delays excluded"],
+    )
     right.caption(
         "Observed behavior describes past recordings. Full stops is the default for traffic-law-compliant planning."
     )
@@ -230,6 +546,15 @@ def prediction_page(store, settings, model):
     departure_date = left.date_input("Planned date", datetime.now(ZoneInfo("America/Toronto")).date())
     departure_time = left.time_input("Departure time", time(9, 0))
     timezone_name = left.text_input("Departure timezone", "America/Toronto")
+    forecast_enabled = left.checkbox(
+        "Use available ECCC hourly forecasts",
+        getattr(model, "variant", "C") == "CW",
+        disabled=getattr(model, "variant", "C") != "CW",
+    )
+    neutral = left.checkbox("Weather-neutral prediction", False)
+    left.caption(
+        "City Page hourly forecasts use the nearest available city within 50 km. They have a short horizon and are regional forecasts. Unavailable sections use the fitted weather-neutral model."
+    )
     if st.button("Predict route", type="primary", disabled=upload is None):
         try:
             departure = (
@@ -239,27 +564,47 @@ def prediction_page(store, settings, model):
             )
             data = upload.getvalue()
             elevation_data = correction.getvalue() if correction else None
-            key = hashlib.sha256(
-                data + (elevation_data or b"") + json.dumps(asdict(settings), sort_keys=True).encode()
-            ).hexdigest()
             with st.spinner("Preparing route and looking up cached OSM roads…"):
-                if st.session_state.get("route_key") != key:
-                    st.session_state.route = prepare_route(
-                        data, upload.name, store, settings, elevation_data
-                    )
-                    st.session_state.route_key = key
+                st.session_state.route = prepare_route(
+                    data, upload.name, store, settings, elevation_data
+                )
                 route = st.session_state.route
+                route_segments, route_controls = route_for_model(route, model)
+                forecast = None
+                if forecast_enabled and not neutral:
+                    from .forecast import CityForecast
+
+                    forecast = CityForecast(store.root, settings)
+                    forecast.prepare(route_segments)
                 result = predict_route(
                     model,
-                    route["segments"],
-                    route["events"],
+                    route_segments,
+                    route_controls,
                     target,
                     None if bike == "Any / unknown" else bike,
                     "full_stop" if scenario == "Full stops" else "observed",
                     breaks,
                     departure,
                     model.validation.get("fitness_selected", False),
+                    weather_provider=forecast,
+                    weather_neutral=neutral,
                 )
+                if forecast is not None:
+                    comparison = predict_route(
+                        model,
+                        route_segments,
+                        route_controls,
+                        target,
+                        None if bike == "Any / unknown" else bike,
+                        "full_stop" if scenario == "Full stops" else "observed",
+                        breaks,
+                        departure,
+                        model.validation.get("fitness_selected", False),
+                        weather_neutral=True,
+                    )
+                    result["neutral_comparison"] = {
+                        k: comparison[k] for k in ("rolling_kmh", "moving_s", "elapsed_s")
+                    }
                 result["warnings"] += route["warnings"]
                 st.session_state.result = result
             st.success("Prediction ready. Open Results in the sidebar.")
@@ -271,11 +616,30 @@ def prediction_page(store, settings, model):
             st.error(
                 f"Could not predict this route: {exc}. Check GPX geometry, elevation profile and timezone."
             )
+    if "route" in st.session_state:
+        coverage = st.session_state.route.get("coverage")
+        if coverage:
+            st.caption(
+                f"Route OSM coverage: {coverage['matched_km'] / max(1e-9, coverage['total_km']):.1%} matched · {coverage['surfaces'].get('unknown', 0) / max(1e-9, coverage['total_km']):.1%} unknown surface."
+            )
+            st.dataframe(
+                pd.DataFrame([{"surface": k, "km": v} for k, v in coverage["surfaces"].items()]),
+                hide_index=True,
+                width="stretch",
+            )
 
 
 def route_map(result, route):
     overlay = st.selectbox(
-        "Route overlay", ["Road surface", "Rolling speed", "Gradient", "Map-match confidence"]
+        "Route overlay",
+        [
+            "Road surface",
+            "Rolling speed",
+            "Headwind / tailwind",
+            "Gradient",
+            "Map-match confidence",
+            "Low-confidence matches",
+        ],
     )
     basemap = st.checkbox(
         "Load an online basemap",
@@ -296,10 +660,21 @@ def route_map(result, route):
             + [[segment.end_lon, segment.end_lat]]
         )
         if overlay == "Road surface":
-            color = COLORS[segment.surface]
+            surface = shape.groupby("surface").ds_m.sum().idxmax() if len(shape) else segment.surface
+            color = COLORS.get(surface, COLORS["unknown"])
         elif overlay == "Rolling speed":
             value = np.clip(segment.rolling_kmh / 45, 0, 1)
             color = [int(230 * (1 - value)), int(80 + 100 * value), int(80 + 100 * value)]
+        elif overlay == "Headwind / tailwind":
+            wind = getattr(segment, "headwind_kmh", np.nan)
+            value = np.clip(abs(wind) / 30, 0, 1) if np.isfinite(wind) else 0
+            color = (
+                [int(130 + 120 * value), 70, 60]
+                if wind > 0
+                else [45, 100, int(130 + 120 * value)]
+                if np.isfinite(wind)
+                else COLORS["unknown"]
+            )
         elif overlay == "Gradient":
             value = np.clip(abs(segment.gradient_pct) / 12, 0, 1)
             color = (
@@ -308,17 +683,34 @@ def route_map(result, route):
                 else [50, 120, int(120 + 130 * value)]
             )
         else:
-            color = [int(210 * (1 - segment.map_confidence)), int(160 * segment.map_confidence), 100]
+            confidence = (
+                float(np.average(shape.map_confidence, weights=np.maximum(0.01, shape.ds_m)))
+                if len(shape)
+                else segment.map_confidence
+            )
+            color = (
+                ([225, 90, 45] if confidence < 0.5 else [60, 160, 110])
+                if overlay == "Low-confidence matches"
+                else [int(210 * (1 - confidence)), int(160 * confidence), 100]
+            )
         rows.append(
             {
                 "path": path,
                 "color": color,
-                "surface": segment.surface,
-                "source": segment.surface_source,
+                "surface": shape.groupby("surface").ds_m.sum().idxmax()
+                if len(shape)
+                else segment.surface,
+                "source": shape.groupby("surface_source").ds_m.sum().idxmax()
+                if len(shape)
+                else segment.surface_source,
                 "speed": round(segment.rolling_kmh, 1),
                 "gradient": round(segment.gradient_pct, 1),
-                "confidence": round(segment.map_confidence, 2),
+                "confidence": round(float(shape.map_confidence.mean()), 2)
+                if len(shape)
+                else round(segment.map_confidence, 2),
                 "km": round(segment.end_m / 1000, 2),
+                "wind": f"{getattr(segment, 'headwind_kmh', np.nan):.1f} km/h headwind",
+                "traffic": "",
                 "hr": round(segment.predicted_hr)
                 if np.isfinite(segment.predicted_hr)
                 else "unavailable",
@@ -347,20 +739,43 @@ def route_map(result, route):
             "position": [e["lon"], e["lat"]],
             "color": [210, 67, 67] if e["kind"] == "stop" else [65, 102, 190],
             "surface": e["kind"],
-            "source": e["source"],
+            "source": e.get("source", "OSM / geometry; not charged by this model"),
             "speed": "—",
             "gradient": round(e["gradient_pct"], 1),
             "confidence": "—",
             "km": round(e["distance_m"] / 1000, 2),
             "hr": "—",
+            "wind": "",
+            "traffic": " | ".join(
+                [
+                    behavior_label(e, "full_stop", "Historical full stop"),
+                    behavior_label(e, "rolling", "Historical rolling slowdown"),
+                    behavior_label(e, "minimal", "Historical minimal slowdown"),
+                    f"Minimum speed: {e.get('expected_minimum_mps') * 3.6:.1f} km/h"
+                    if e.get("expected_minimum_mps") is not None
+                    else "Minimum speed unavailable",
+                    f"Moving loss {e.get('moving_loss_s', 0):.1f}s; wait {e.get('stationary_s', 0):.1f}s",
+                    f"{e.get('local_encounters', 0)} local / {e.get('encounters', 0)} relevant encounters; {e.get('confidence', 'unavailable')} confidence",
+                    e.get("source", "Uncharged by selected baseline"),
+                ]
+            ),
         }
-        for e in result["events"]
+        for e in list(result["events"])
+        + [
+            e
+            for e in route["events"]
+            if not any(
+                e["identity"] == charged["identity"] and abs(e["distance_m"] - charged["distance_m"]) < 3
+                for charged in result["events"]
+            )
+        ]
         if e["kind"] in markers
     ]
     layers.append(
         pdk.Layer(
             "ScatterplotLayer",
             events,
+            id="traffic-controls",
             get_position="position",
             get_fill_color="color",
             get_radius=12,
@@ -368,7 +783,7 @@ def route_map(result, route):
             pickable=True,
         )
     )
-    st.pydeck_chart(
+    selected = st.pydeck_chart(
         pdk.Deck(
             layers=layers,
             map_provider="carto",
@@ -377,11 +792,16 @@ def route_map(result, route):
                 latitude=float(points.lat.mean()), longitude=float(points.lon.mean()), zoom=10
             ),
             tooltip={
-                "text": "{km} km · {surface} ({source})\n{speed} km/h · gradient {gradient}%\nHR {hr} · map confidence {confidence}"
+                "text": "{km} km · {surface} ({source})\n{speed} km/h · gradient {gradient}%\nHR {hr} · map confidence {confidence}\n{wind}\n{traffic}"
             },
         ),
         height=480,
+        key="route-traffic-map",
+        on_select="rerun",
+        selection_mode="single-object",
     )
+    for marker in selected.selection.objects.get("traffic-controls", []):
+        st.info(marker.get("traffic", ""))
     st.caption(
         "Map data © OpenStreetMap contributors · optional basemap © CARTO. Gray = unknown surface. Inferred surfaces are labeled in tooltips."
     )
@@ -395,7 +815,7 @@ def results_page():
         return
     route = st.session_state.route
     st.caption(
-        f"{route['filename']} · {result['distance_m'] / 1000:.1f} km · {result['model_kind']} · {result['scenario']} scenario"
+        f"{route['filename']} · {result['distance_m'] / 1000:.1f} km · model {result.get('model_variant', 'C')} · {result['model_kind']} · {result['scenario']} scenario"
     )
     a, b, c = st.columns(3)
     a.metric("Cruising speed", f"{result['cruise_kmh']:.1f} km/h")
@@ -449,6 +869,25 @@ def results_page():
     frame = result["segments"].copy()
     frame["Distance (km)"] = frame.end_m / 1000
     frame["Elapsed (hours)"] = frame.accumulated_elapsed_s / 3600
+    if "headwind_kmh" in frame:
+        st.caption(
+            f"ECCC weather available for {result.get('weather_distance_coverage', 0):.1%} of route distance. Positive headwind opposes travel; negative values are tailwind."
+        )
+        st.plotly_chart(
+            px.line(
+                frame,
+                x="Distance (km)",
+                y=["headwind_kmh", "crosswind_kmh"],
+                title="Headwind / tailwind and signed crosswind",
+                labels={"value": "Wind component (km/h)"},
+            ),
+            width="stretch",
+        )
+        if result.get("neutral_comparison"):
+            neutral = result["neutral_comparison"]
+            st.info(
+                f"Weather-neutral comparison: {neutral['rolling_kmh']:.1f} km/h rolling, {duration(neutral['moving_s'])} moving, {duration(neutral['elapsed_s'])} elapsed."
+            )
     st.plotly_chart(
         px.line(
             frame,
@@ -491,7 +930,21 @@ def results_page():
             width="stretch",
         )
     st.subheader("Surface composition by distance")
-    st.dataframe(result["surfaces"], hide_index=True, width="stretch")
+    coverage = route.get("coverage")
+    composition = (
+        pd.DataFrame(
+            [
+                {"surface": k, "distance_km": v, "percent": v / max(1e-9, coverage["total_km"]) * 100}
+                for k, v in coverage["surfaces"].items()
+            ]
+        )
+        if coverage
+        else result["surfaces"]
+    )
+    st.dataframe(composition, hide_index=True, width="stretch")
+    with st.expander("Inspect original GPX and selected OSM geometry"):
+        if st.checkbox("Open planned-route matching inspector"):
+            matching_inspector(route["points"])
     with st.expander("Inspect a route segment"):
         number = st.number_input("Segment number", 1, len(frame), 1)
         segment = frame.iloc[int(number) - 1]
@@ -512,6 +965,28 @@ def results_page():
             "rolling_kmh",
             "moving_loss_s",
             "stationary_delay_s",
+        ]
+        keys += [
+            k
+            for k in [
+                "headwind_kmh",
+                "crosswind_kmh",
+                "wind_speed_kmh",
+                "wind_from_deg",
+                "air_temperature_c",
+                "humidity_pct",
+                "precipitation_mm",
+                "pressure_kpa",
+                "weather_source",
+                "weather_station_ids",
+                "weather_station_distance_km",
+                "weather_age_minutes",
+                "weather_confidence",
+                "weather_uncertainty_kmh",
+                "weather_forecast_issue_utc",
+                "arrival_time_utc",
+            ]
+            if k in segment.index
         ]
         values = segment[keys].map(
             lambda v: (
@@ -538,6 +1013,10 @@ def results_page():
                         "local_encounters",
                         "source",
                         "stationary_known",
+                        "expected_minimum_mps",
+                        "behavior_probabilities",
+                        "stop_probability_interval",
+                        "confidence",
                     ]
                 ],
                 hide_index=True,
@@ -575,6 +1054,24 @@ def performance_page(store, model):
         f"{support['measured_hr_rides']} measured-HR rides · {support['imputed_hr_rides']} imputed-HR rides · last trained {model.trained_at}"
     )
     report = model.validation
+    if report.get("comparisons"):
+        st.subheader("Paired model accuracy")
+        comparison = pd.DataFrame(
+            [{k: v for k, v in c.items() if k != "groups"} for c in report["comparisons"]]
+        )
+        st.dataframe(comparison, hide_index=True, width="stretch")
+        st.caption(
+            f"Default {store.get_state('training', {}).get('variant', report['selected_variant'])} follows your Model C preference. Half-life and fitness use earlier selection folds ({report['selection_rides']} rides, ending {report['selection_last'][:10]}). All variants use the same {report['final_rides']} final test rides starting {report['final_first'][:10]}. Long rides were included before looking at errors."
+        )
+        baseline_variant = "B" if "B" in set(comparison.variant) else "A"
+        baseline = comparison.loc[comparison.variant.eq(baseline_variant), "speed_mae_kmh"].iloc[0]
+        for candidate in report["comparisons"]:
+            if candidate["variant"] != baseline_variant and candidate["speed_mae_kmh"] > baseline:
+                st.warning(
+                    f"Model {candidate['variant']} regressed by {candidate['speed_mae_kmh'] - baseline:.2f} km/h on final folds. Missing surface tags, ambiguous parallel roads and sparse/control-biased observations may limit these features. Final fold errors are not used to tune the model."
+                )
+        if report.get("weather_evaluation"):
+            st.caption(report["weather_evaluation"])
     if report.get("status") != "complete":
         st.info(
             report.get("reason", "Validation was not run. Enable chronological validation and retrain.")
@@ -609,18 +1106,18 @@ def performance_page(store, model):
     )
     if report.get("interval_provisional"):
         st.info(
-            "Intervals are provisional: fewer than 20 independent calibration rides. Cycling conditions can change, so coverage is not guaranteed."
+            "Intervals are provisional when there are fewer than 20 calibration rides or measured coverage is below the 90% target. Changing conditions and correlated rides limit confidence."
         )
     st.caption(
         "Half-life and fitness variant use the earlier selection folds. The later rides calibrate uncertainty. Each model and behavioral distribution uses rides strictly before its test ride."
     )
-    rows = pd.DataFrame(report["rows"])
+    rows = pd.DataFrame(report.get("paired_rows", report["rows"]))
     st.plotly_chart(
         px.scatter(
             rows,
             x="actual_rolling_kmh",
             y="predicted_rolling_kmh",
-            color="split",
+            color="variant" if "variant" in rows else "split",
             hover_data=["date", "distance_km"],
             title="Chronological predictions versus recorded rolling speed",
         ),
@@ -633,8 +1130,23 @@ def performance_page(store, model):
         st.caption(
             f"Separate recent-fitness correction {'selected' if report.get('fitness_selected') else 'not selected'} by earlier validation. Current multiplier: {model.fitness_adjustment:.3f}."
         )
-    st.subheader("Errors by terrain and ride length")
-    for dimension, grouped in report["groups"].items():
+    st.subheader("Errors by terrain, wind, HR and ride length")
+    groups = report["groups"]
+    if report.get("comparisons"):
+        grouped_variant = st.selectbox(
+            "Diagnostic model",
+            [c["variant"] for c in report["comparisons"]],
+            index=next(
+                (
+                    i
+                    for i, c in enumerate(report["comparisons"])
+                    if c["variant"] == report["selected_variant"]
+                ),
+                0,
+            ),
+        )
+        groups = next(c["groups"] for c in report["comparisons"] if c["variant"] == grouped_variant)
+    for dimension, grouped in groups.items():
         st.write(dimension.replace("_", " ").title())
         st.dataframe(pd.DataFrame(grouped), hide_index=True, width="stretch")
     trend = rides[["date", "distance_m", "moving_s", "measured_avg_hr"]].copy()

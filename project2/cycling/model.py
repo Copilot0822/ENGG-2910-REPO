@@ -57,19 +57,22 @@ def training_weights(segments, reference_date, half_life_days):
 class FeatureEncoder:
     categories: dict = field(default_factory=dict)
     ranges: dict = field(default_factory=dict)
+    numeric: list = field(default_factory=lambda: NUMERIC.copy())
 
     def fit(self, frame):
         for col in CATEGORICAL:
             self.categories[col] = list(frame[col].fillna("unknown").value_counts().head(60).index)
-        for col in NUMERIC:
-            values = pd.to_numeric(frame[col], errors="coerce")
+        for col in getattr(self, "numeric", NUMERIC):
+            values = pd.to_numeric(frame.get(col, pd.Series(np.nan, index=frame.index)), errors="coerce")
             self.ranges[col] = (float(values.min()), float(values.max()))
         return self
 
     def transform(self, frame, hr=None):
         columns = []
-        for col in NUMERIC:
-            value = pd.to_numeric(frame[col], errors="coerce").to_numpy(dtype=float)
+        for col in getattr(self, "numeric", NUMERIC):
+            value = pd.to_numeric(
+                frame.get(col, pd.Series(np.nan, index=frame.index)), errors="coerce"
+            ).to_numpy(dtype=float)
             # Do not extend an unlearned fatigue or fitness trend indefinitely past observed support.
             lo, hi = self.ranges.get(col, (-np.inf, np.inf))
             if col in ("planned_km", "completed_km", "gain_m", "moving_hours", "observation_day"):
@@ -84,7 +87,7 @@ class FeatureEncoder:
 
     @property
     def categorical_mask(self):
-        return [False] * len(NUMERIC) + [True] * len(CATEGORICAL)
+        return [False] * len(getattr(self, "numeric", NUMERIC)) + [True] * len(CATEGORICAL)
 
 
 def profile_features(frame):
@@ -146,6 +149,17 @@ class CyclingModel:
             result = np.exp(log_speed)
         if use_fitness:
             result *= self.fitness_adjustment
+        if getattr(self, "neutral_model", None) is not None:
+            available = (
+                frame.get("weather_available", pd.Series(False, index=frame.index))
+                .fillna(False)
+                .to_numpy(dtype=bool)
+            )
+            if (~available).any():
+                supplied = np.asarray(hr)[~available] if hr is not None else None
+                result[~available] = self.neutral_model.predict_cruise(
+                    frame.loc[~available], supplied, False
+                ) * (self.fitness_adjustment if use_fitness else 1)
         low, high = self.support.get("speed_bounds", (0.8, 90.0))
         return np.clip(result, max(0.8, low), min(100.0, high))
 
@@ -167,7 +181,7 @@ class CyclingModel:
         temporary.replace(path)
 
 
-def fit_model(rides, segments, observations, half_life=120, reference_date=None):
+def fit_model(rides, segments, observations, half_life=120, reference_date=None, weather=False):
     if len(rides) == 0 or len(segments) == 0:
         raise ValueError("Import and process at least one outdoor cycling ride before training.")
     ids = set(rides.id.astype(str))
@@ -180,7 +194,9 @@ def fit_model(rides, segments, observations, half_life=120, reference_date=None)
     reference = pd.Timestamp(reference_date or rides.date.max())
     if reference.tzinfo is None:
         reference = reference.tz_localize("UTC")
-    encoder = FeatureEncoder().fit(cruise)
+    from .weather import WEATHER_NUMERIC
+
+    encoder = FeatureEncoder(numeric=NUMERIC + (WEATHER_NUMERIC if weather else [])).fit(cruise)
     weights = training_weights(cruise, reference, half_life)
     speeds = cruise.speed_kmh.to_numpy()
     dates = pd.to_datetime(rides.date, utc=True)
@@ -255,7 +271,7 @@ def fit_model(rides, segments, observations, half_life=120, reference_date=None)
             model.hr_range = (float(low), float(high))
             hw = training_weights(hr_data, reference, half_life)
             residual = np.log(hr_data.speed_kmh) - model.base.predict(encoder.transform(hr_data))
-            monotonic = [0] * (len(NUMERIC) + len(CATEGORICAL)) + [1]
+            monotonic = [0] * (len(encoder.numeric) + len(CATEGORICAL)) + [1]
             model.hr_model = HistGradientBoostingRegressor(
                 max_iter=65,
                 max_leaf_nodes=8,
@@ -273,12 +289,25 @@ def fit_model(rides, segments, observations, half_life=120, reference_date=None)
             within_ride = hr_data.measured_hr - hr_data.ride_id.map(averages)
             model.hr_profile = Ridge(alpha=100)
             model.hr_profile.fit(profile_features(hr_data), within_ride, sample_weight=hw)
+    if weather:
+        model.neutral_model = fit_model(
+            rides, segments, observations, half_life, reference_date, weather=False
+        )
+        model.support["weather_cruise_segments"] = int(
+            cruise.get("weather_available", pd.Series(False, index=cruise.index)).sum()
+        )
+        model.support["weather_features"] = WEATHER_NUMERIC
+        model.kind += " + ECCC station weather"
     # Measured-only HR adjustment means imputed rides retain their full terrain-learning weight.
     return model
 
 
 def load_model(store):
-    if not store.model_path().exists():
-        return None
     # Only load this app's own local fitted models. Never deserialize an uploaded joblib file.
-    return joblib.load(store.model_path())
+    active = store.get_state("training", {}).get("variant")
+    preferred = [f"model-{active}.joblib"] if active in ("C", "CW") else []
+    for name in preferred + ["model-CW.joblib", "model-C.joblib", "cycling.joblib", "model-B.joblib"]:
+        path = store.root / "models" / name
+        if path.exists():
+            return joblib.load(path)
+    return None

@@ -41,8 +41,8 @@ downloaded automatically by uv when needed. No Docker, account credentials or AP
    elevation. More features do not guarantee better accuracy; the dashboard explicitly reports
    when the segment model does not beat a simple baseline.
 
-Strava account exports can be requested from **Settings → My Account → Download your account →
-Get Started → Request download**. Download the account ZIP when Strava makes it available.
+Strava account exports can be requested from **Settings > My Account > Download your account >
+Get Started > Request download**. Download the account ZIP when Strava makes it available.
 See [Strava's export documentation](https://support.strava.com/en-us/articles/15401919-how-do-i-export-my-strava-data).
 Komoot's route export menu provides the GPX file for a planned tour; export access depends on
 your Komoot account and region entitlement. See [Komoot GPX export help](https://support.komoot.com/hc/en-us/articles/10115477099674-Export-and-import-Routes-and-Activities).
@@ -51,7 +51,7 @@ your Komoot account and region entitlement. See [Komoot GPX export help](https:/
 
 This directory is a standalone Python project, independent of the repository's parent project.
 It has its own `pyproject.toml`, committed `uv.lock`, `.python-version` and ignored `.venv`.
-Always run commands **from `project2`** or use `uv run --project project2 …` from the repository root.
+Always run commands **from `project2`** or use `uv run --project project2 ...` from the repository root.
 Verify the interpreter with:
 
 ```powershell
@@ -61,85 +61,108 @@ uv run ruff check .
 ```
 
 The interpreter path ends in `project2\.venv\Scripts\python.exe`. Dependencies are pinned by
-`uv.lock`; `uv sync --locked` reproduces them. The optional PBF reader needs `uv sync --extra pbf`.
+`uv.lock`; `uv sync --locked` reproduces them. PBF support is included in the normal sync; pyosmium has a native Windows wheel.
 
 ## CLI
 
-The command-line pipeline is the same as the web app. Example PowerShell commands:
+The command-line pipeline is the same as the web app. Save `osm_provider: "local"` in the
+sidebar or configuration before processing these extracts. Example PowerShell commands:
 
 ```powershell
 uv run cycling import "C:\Users\you\Downloads\export.zip"
+uv run cycling osm regions
+uv run cycling osm download --regions ontario quebec new-brunswick prince-edward-island
+uv run cycling osm index
 uv run cycling process
-uv run cycling train --optimize-half-life --validation-rides 16
+uv run cycling train --optimize-half-life --validation-rides 48
 uv run cycling predict "C:\Users\you\Downloads\planned.gpx" --hr 142 --scenario full_stop --break-minutes 15
 uv run cycling status
 uv run cycling config
 ```
 
-Use `cycling process --refresh-osm` after changing OSM providers or fetching more tiles.
+`cycling process` detects new rides and changed relevant extracts/matching versions automatically.
+Use `--refresh-osm` only to force a rebuild. `cycling osm report` recalculates coverage from caches.
+`cycling compare --validation-rides 48` performs the same paired A/B/C evaluation as validated
+training in local mode; it preserves all candidate models and retains Model C as the default regardless of accuracy ranking.
+When ECCC enrichment is available, it compares B, C and C+Weather on the same folds.
 `cycling train --no-validation` provides a quick fit but no calibrated prediction interval.
 `cycling predict --output data\prediction.csv` saves private segment results locally.
-`cycling --data-dir <path> …` or `CYCLING_DATA_DIR` can override the default data directory.
+`cycling --data-dir <path> ...` or `CYCLING_DATA_DIR` can override the default data directory.
 If you choose another directory inside Git, add it to your ignore rules before storing private data.
 
 ## OSM and map matching
 
-Configure the sidebar and save, or create ignored `config.local.json` with selected fields:
+For full history, select **local** in the sidebar. Download public regional extracts once from
+[Geofabrik Canada](https://download.geofabrik.de/north-america/canada.html), using the CLI above
+or the Historical Data extract controls. The `osm regions` command summarizes historical distance
+in coarse geographic cells locally. Choose extracts covering those cells; the downloader supports
+Ontario, Quebec, New Brunswick and Prince Edward Island. Other regions can be downloaded from
+Geofabrik and configured by path. No GPS recordings are sent to a matching service.
+
+Save the settings in the sidebar or use ignored `config.local.json`:
 
 ```json
 {
-  "osm_provider": "overpass",
-  "overpass_url": "https://overpass-api.de/api/interpreter",
-  "osm_max_tiles": 12,
-  "osm_min_interval_s": 3.0,
-  "half_life_days": 120,
+  "osm_provider": "local",
+  "local_osm_paths": [],
+  "half_life_days": 365,
   "optimize_half_life": true,
-  "validation_rides": 16
+  "validation_rides": 48,
+  "osm_workers": 3
 }
 ```
 
-Three working modes are provided:
+Empty paths discover `data/osm/extracts/*.osm.pbf`. To use externally stored extracts, set
+`local_osm_path` for one file or `local_osm_paths` to a list of absolute paths. XML, compressed XML,
+Overpass JSON and PBF are accepted. PBF processing streams highway ways and control nodes using
+[pyosmium](https://docs.osmcode.org/pyosmium/latest/reference/File-Processing/), storing complete
+road geometry and tags in a separate SQLite/RTree index per extract. Node location indexing uses
+memory while building the index; province extracts require several GB of available memory and
+disk. No Docker, routing server, credentials or API keys are needed.
 
-| Mode | Configuration | Behavior |
-|---|---|---|
-| Offline, default | `osm_provider: "offline"` | Reuse cached road tiles; uncovered surface/control data remains unknown. No road-service requests. |
-| Bounded Overpass | `osm_provider: "overpass"` | Query coarse 0.02° road tiles, cache for 180 days, at least 3 seconds between requests, up to 12 new tiles per processing batch, with up to three attempts. Both limits are configurable. |
-| Local extract | `osm_provider: "local"`, `local_osm_path: "C:/maps/region.osm"` | Read OSM XML, `.osm.gz`, Overpass JSON, or optional PBF on the local machine. No public service or Docker required. |
+The local directed HMM evaluates GPS distance and heading together with bounded shortest-path
+transitions between consecutive anchors, using forward/backward costs and Viterbi. Connectivity
+uses OSM node IDs: geometric bridge/tunnel crossings are never joined. Bicycle prohibitions and
+oneway:bicycle overrides are respected. Timestamp bounds reject impossible transitions; sparse
+samples retain their original geometry. The matcher annotates the trace and **never replaces it
+with a routed path**. Persistent graph and spatial-index caches avoid rebuilding province data.
 
-Overpass sends **coarse geographic bounding boxes**, not activity recordings, heart rates, account
-details or ZIP contents. Those bounding boxes still disclose an approximate area to the provider.
-For no location disclosure, use local OSM or offline mode and leave the online basemap disabled.
-Overpass defaults are intentionally bounded. Large histories need repeated batches or a regional
-local extract; cached tiles are reused, and exhausted requests leave explicit unknown coverage.
-Public services can return 429/504 errors; the app falls back to cached/unknown roads. An endpoint
-can be replaced with your own Overpass server. See [Overpass public-instance usage](https://dev.overpass-api.de/overpass-doc/en/preface/commons.html).
+Each point retains way/edge IDs, raw tags, original and matched geometry, travel direction,
+represented distance, offset and confidence. Confidence is a heuristic score, not a calibrated
+probability or surveyed truth. Scores below 0.50 remain explicit low-confidence matches and receive
+unknown model labels; high confidence starts at 0.75. Indistinguishable parallel roads/path sections
+remain uncertain. The inspector overlays original GPS, selected OSM edges and uncertain/untagged
+sections, with random historical activity selection and distance-window inspection.
 
-The built-in matcher searches projected OSM road edges and scores distance, heading, one-way
-restrictions and continuity. It preserves travel direction and the original route geometry. Surface,
-smoothness, tracktype, highway, bicycle and original tags are stored for each segment. Inferred
-tracktype labels remain separate from known surface tags. A proximity/heading confidence is
-reported; it is a heuristic match score, not a calibrated probability. Parallel roads, trails and
-complex junctions can be ambiguous. Missing surface tags are never assumed to mean asphalt.
+Surfaces come from actual surface tags. Tracktype inference is flagged separately; untagged highway
+classes are never silently labeled paved. The dashboards weight coverage and composition by
+represented distance rather than GPS point counts. Original unusual tags remain available even
+when classification is unknown. Current extracts describe today's map, not the exact historical
+network at each ride date. Downloaded source timestamps, SHA-256 and index metadata are retained.
 
-Controls must belong to a matched road and pass forward/backward approach tests. A side-road
-sign cannot be assigned solely because it is near the route. Shared-junction controls without
-approach information, numeric directional tags, and low-confidence matches are flagged or
-omitted instead of charged as confirmed stops. This can undercount incompletely mapped controls.
-See [OSM stop direction tags](https://wiki.openstreetmap.org/wiki/Tag:highway%3Dstop).
+Controls require traversal of a connected matched approach, appropriate direction tags and adequate
+confidence. A nearby side-road stop or pedestrian-only signal is excluded. Shared signals on short
+connected approaches are clustered; repeated traversals are separate encounters. Shared stop
+nodes with unspecified approach and unsupported numeric directional tags are uncertain. Sparse
+crossings can be detected between anchors, without requiring a sample precisely at the control.
+Relations/turn restrictions, lanes, signal programs and every OSM tagging convention are not
+fully interpreted; these are limitations of matching and control coverage, not inferred certainty.
 
-**Optional Valhalla:** set `valhalla_url` to an existing local service such as
-`http://127.0.0.1:8002`. The app calls `/trace_attributes` in bounded chunks and uses matching
-OSM way IDs to confirm compatible local matches; it never adopts a rerouted geometry. This is a
-conservative integration, not a full network-wide sequence matcher. An unavailable service falls
-back to the working directional matcher. No Valhalla installation is required. Running a full
-Valhalla service and building regional tiles is an advanced, separately managed option; this
-project does not claim a bundled native Windows Valhalla server. A remote URL sends route
-coordinates to that configured service. See [Valhalla map-matching API](https://valhalla.github.io/valhalla/api/map-matching/api-reference/).
+**Offline** retains bounded cached road lookups or unknown labels without network requests.
+**Overpass** is available only for small route lookups, with the existing tile budget, throttling,
+retries and caching; bulk history deliberately rejects this mode. Coarse bounding boxes disclose
+approximate route areas to the provider. For private matching use local extracts and leave the
+online basemap disabled. Optional Valhalla confirmation accepts localhost endpoints only; the
+built-in HMM is operational without it. Online map tiles are requested only when explicitly enabled.
 
-Local XML/PBF extracts are loaded into memory; use a regional road extract, not a planet file.
-PBF support uses pyosmium with node-location indexing. Relations, lane-specific signal programs,
-turn restrictions and road-network routing are not fully interpreted. OSM attribution is included
-on the map. Online basemaps load from CARTO/OSM only when enabled.
+Extract updates rebuild only their source indexes. Historical signatures include relevant source
+fingerprints, matcher version and segmentation version. Each completed ride persists annotations,
+segments and encounters, making interrupted processing resumable without reparsing FIT files.
+Up to three local workers process different rides; `osm_workers: 1` reduces memory/CPU use.
+Paired backtests also use up to three separate local processes, each with bounded numerical
+threads; set `comparison_workers: 1` for serial evaluation.
+GPX caches include content/elevation correction and relevant OSM revisions. Uncovered routes remain
+unchanged with unknown attributes and warning messages.
 
 ## Import and cache behavior
 
@@ -246,19 +269,36 @@ when available; missing HR does not become artificial evaluation truth. Imputati
 category encoding, feature ranges, recency normalization and intersection observations are
 recomputed from each training prefix. No random segment validation is used.
 
-The earlier half of eligible test rides selects among 60/90/120/180/365-day half-lives when enabled.
-It also compares a restrained recent-fitness correction based on **earlier forecast residuals**.
-That variant is selected only with at least three selection rides and an improvement over 3%.
-The later half is held out for final accuracy and uncertainty calibration. Models may use those
-rides only when predicting subsequent rides. At least seven rides are needed for the separate
-selection/calibration workflow. More tests are configurable, but repeated fitting costs time.
+In local mode with at least 20 rides, validated training compares three variants on the same
+chronological test rides: **A** preserves the original geometry model and its cruising labels;
+**B** adds surface/road attributes with geometry-only interruption accounting; **C** also excludes
+mapped traffic windows from cruising labels and adds their moving and stationary effects once.
+A private Phase 1 snapshot can preserve the exact original segments/model for comparison. When
+absent, geometry-only labels are reconstructed from cleaned traces. No private baseline is tracked.
 
-Report speed MAE, moving-time MAE, elapsed-time MAE for sufficiently reliable observations,
-median absolute moving-time percentage error, and historical median-speed/gradient baselines.
-Elapsed-time errors are unavailable when road/control coverage, modeled waits or timestamps are insufficient;
-the diagnostic lower-bound elapsed error is still retained. Errors are grouped by distance,
-dominant surface, and elevation gain. Unknown controls and personal stops can still bias elapsed
-accuracy, so its quality is reported separately from moving speed.
+Earlier selection folds choose each variant's half-life (60/90/120/180/365 days) and evaluate the
+restrained prefix-only fitness correction. Hyperparameter choices are frozen before final evaluation. The traffic-aware default follows the user preference and is not selected from final errors.
+The final folds follow all selection folds; every prediction refits only earlier rides. Distance
+stratification includes long rides before inspecting errors. With `validation_rides: 48`, the
+comparison uses 12 selection and up to 32 final rides, retaining sufficient training history.
+Smaller datasets use fewer folds; ordinary validation remains available below 20 rides.
+
+Reports include paired speed MAE/RMSE, moving-time MAE/bias, measured-HR status, losses/waits,
+interval coverage and errors by distance, elevation, paved/gravel composition and month. The prior
+reported MAE on eight late rides is preserved for context; it is not directly comparable with a
+new 32-ride sample. Use the A/B/C results on identical folds to assess improvement or regression.
+Current OSM coverage/ambiguity and sparse control observations can worsen accuracy. The UI reports
+regressions without claiming that additional features guarantee improvement.
+
+Model C is the persistent default, with C+Weather preferred after weather-aware training. B stays selectable as a comparator/fallback. C uses explicit mapped-traffic waits and the full-stop scenario. A/B do not add
+mapped traffic penalties to labels already containing those effects; their elapsed totals are
+lower bounds. The same variant-specific feature/label construction is used for new GPX prediction.
+
+Elapsed accuracy requires reliable timestamps, sufficient matched coverage, no unlearned modeled
+waits, and at least 90% of recorded stationary time attributable to reliable traffic windows.
+Unclassified personal stops and recording gaps therefore often leave elapsed MAE unavailable.
+This is reported separately from rolling-speed accuracy. A diagnostic elapsed lower-bound error
+is retained, but is not presented as reliable traffic-delay accuracy.
 
 90% rolling-speed intervals use a finite-sample upper quantile of absolute speed errors from
 the later chronological calibration set, and transform endpoints into moving-time bounds.
@@ -282,12 +322,13 @@ OSM responses. They cover formats/units, archive bounds, duplicates, HR imputati
 surface uncertainty, travel direction, measured full versus rolling stops, signal waits, recording
 gaps, pause events, disconnected routes, adaptive fatigue features, cutoff separation, held-out
 sensor stripping, time-weighted HR optimization, fallback prediction, non-overlapping time
-accounting, caching and the Streamlit workflow. Tests do not call public OSM services.
+accounting, caching and the Streamlit workflow. Tests mock OSM and ECCC responses and do not call public weather services.
 
 | Module | Responsibility |
 |---|---|
 | `recordings.py`, `importer.py` | Secure parsing, unit normalization, metadata, incremental imports |
-| `geometry.py`, `osm.py` | Trace quality, terrain, cache/providers, directional road/control annotations |
+| `geometry.py`, `osm.py`, `network.py`, `matching.py` | Trace quality, streaming regional indexes, directed HMM and control annotations |
+| `coverage.py`, `comparison.py` | Distance-weighted quality reports and paired A/B/C chronological evaluation |
 | `features.py`, `events.py` | Adaptive segments, cruising labels, turn/traffic behavior and fallback physics |
 | `model.py`, `prediction.py` | Personal training, measured-HR effects, constrained pacing, exclusive time ledger |
 | `validation.py`, `pipeline.py` | Earlier-only evaluation, calibration, reusable workflows |
@@ -296,10 +337,10 @@ accounting, caching and the Streamlit workflow. Tests do not call public OSM ser
 
 ## Limits and future improvements
 
-* Weather/wind, drafting, traffic density, equipment changes, rider intent, sleep and nutrition are
-  not independently modeled. Speed at an HR is observational, not a causal guarantee.
-* Local matching is conservative rather than a global HMM. Valhalla currently confirms compatible
-  annotations; ambiguous route-wide alignment, traffic lane programs and road relations are limited.
+* Station weather is modeled observationally; road shelter, drafting, signal cycles, equipment changes, rider intent, sleep and nutrition are
+  not independently measured. Speed at an HR is observational, not a causal guarantee.
+* Local HMM search is bounded to six candidates and local transitions. Ambiguous parallel roads,
+  incomplete topology, turn restriction relations and lane-specific signal programs remain limited.
 * Geometry-derived corner radius is approximate; OSM matching retains original GPX coordinates.
   A supplied DEM/elevation correction is supported, but no automatic global elevation download is bundled.
 * HR drift and fatigue can be hard to separate from hills/effort. The model controls for mapped terrain,
@@ -311,9 +352,89 @@ accounting, caching and the Streamlit workflow. Tests do not call public OSM ser
   flagged instead of advertised as an improvement. Feature-attribution/causal explanations, nested
   hyperparameter searches, probabilistic HR dynamics and calibrated elapsed intervals are not included.
 * Configured ZIP/point limits bound individual inputs; parsing a large allowed archive can still take
-  substantial memory/time. Regional local OSM extracts are loaded in memory. No background job queue
+  substantial memory/time. PBF node-location indexing requires memory during the one-time index build. No background job queue
   or multi-user shared-data deployment is provided; run this as a single-user local app.
 
 All actual exports, GPS files, Parquet, SQLite state, JSON reports, configuration and fitted models
 must stay in ignored locations. The default `data/` and private file extensions are ignored.
 Do not commit personal artifacts or credentials. No Strava API account or hardcoded key is needed.
+
+## ECCC weather and Phase 3 traffic behavior
+
+```powershell
+uv run cycling weather enrich
+uv run cycling weather report
+uv run cycling train --enrich-weather --optimize-half-life --validation-rides 48
+uv run cycling predict "planned-route.gpx" --hr 145 --departure "2026-10-11T09:00:00-04:00" --forecast
+uv run cycling predict "planned-route.gpx" --model-variant CW --weather-neutral
+```
+
+The Historical Data page provides weather enrichment/retry, cache-only operation, station metadata,
+missing values and coverage reports. UI training enriches missing weather by default; CLI training
+uses `--enrich-weather` for this step. `weather --offline` uses cached records. Retraining never
+switches the default away from the C family. B, C and C+Weather remain distinct saved models.
+Weather-neutral C+Weather inference uses its separately fitted terrain model, rather than invented
+zero wind or artificial typical weather.
+
+The primary sources are [ECCC hourly observations](https://api.weather.gc.ca/collections/climate-hourly)
+and [station metadata](https://api.weather.gc.ca/collections/climate-stations). The API only covers
+a subset of archived stations, so missing stations are checked against the official monthly
+[historical downloads](https://climate.weather.gc.ca/FAQ_e.html). Hourly archive CSV times are local
+**standard** time, converted using station offsets without daylight saving. API UTC timestamps
+remain UTC. Coarse whole-degree metadata bounds disclose a general area; observation requests use
+station IDs and calendar months, not GPS traces. Monthly cache reuse avoids repeated queries.
+Requests are serial, throttled to one per second, bounded to 700 per operation, retried on failure,
+and paginated at 1,000 items with a page cap. Transient failures are not cached as successful empties.
+ECCC attribution, meaningful User-Agent and caching follow the
+[MSC usage policy](https://eccc-msc.github.io/open-data/usage-policy/readme_en/).
+
+Segments use original recorded passage timestamps and local route bearings. Candidate selection
+considers distance, available observations, elevation difference and quality flags. Up to two
+suitable stations are blended, with station IDs, distance, timestamp age, interpolation status,
+source records and an explicitly heuristic uncertainty estimate retained. Temporal wind interpolation
+operates on vector components, so northward wraparound is correct; hourly precipitation accumulations
+are not linearly interpolated. Long missing intervals remain missing. Station winds are generally
+measured at 10 m and do not measure rider-height wind or shelter. ECCC describes wind in km/h and
+from-direction in tens of degrees; calm is distinguished from missing/variable direction.
+See the [official glossary](https://climate.weather.gc.ca/glossary_e.html).
+
+Headwind is `W*cos(from_direction-travel_bearing)` and signed crosswind is the corresponding sine,
+in radians. Positive headwind opposes travel. The boosted weather model learns nonlinear speed
+relationships using headwind, signed/absolute crosswind, wind speed, temperature, humidity,
+precipitation and pressure. Missing-weather sections use the separately fitted terrain model.
+Measured-HR training remains distinct from median-imputed ride HR; training cutoffs are unchanged.
+
+The initial working forecast provider uses official
+[City Page hourly forecasts](https://eccc-msc.github.io/open-data/msc-data/citypage-weather/readme_citypageweather_en/),
+selecting nearby cities within 50 km. Each segment records the source city, distance, issue time and
+valid time. This is a regional city forecast, **not a road-scale forecast or gridded product**.
+Conditions are reevaluated at predicted segment arrival times until timing stabilizes, and traffic
+context also advances along the journey. Outside the hourly horizon, predictions become weather-neutral.
+Precipitation probability is not treated as a rainfall amount. Unspecified personal-break locations
+are not inserted into segment arrival times. Forecast and neutral scenarios are available side by side.
+
+[HRDPS](https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps_en/) and GeoMet WCS were
+investigated. Automated gridded HRDPS retrieval/resampling remains an extension to the modular provider;
+it is not bundled. Forecast skill has not been validated against archived issued forecasts.
+Retrospective validation uses actual observed weather at recorded passage times and is labeled accordingly.
+
+Stop analysis now requires consecutive near-zero recorded speed close to the control and short sample
+intervals. Sparse sampling, unobserved gaps, incomplete approach/recovery, uncertain road matches and
+long potentially personal dwells are excluded. Metrics include speed at the sign, braking onset distance,
+braking and acceleration duration, recovery distance, gradient, surface, turn direction and stable
+approach identity. Contextual pools consider road type, turning, surface, gradient, hour/weekend and
+approach direction. Sparse intersections borrow a 12-encounter prior; full/rolling/minimal probabilities
+sum to one. Predicted loss uses the mixture expectation; signal wait is stop probability times the
+conditional stopped-wait distribution. These descriptive probabilities are not legal advice or exact
+signal-phase forecasts. Full-stop planning still reaches zero at stop signs.
+
+The map supports headwind/tailwind overlays and clickable traffic markers with probabilities,
+minimum speed, moving loss, wait, local/broad counts, confidence and generalized/location-specific source.
+Performance reports include paired errors by wind, HR, surface, distance and traffic density, plus
+held-out stop Brier scores and wait errors. Individual encounter truth is used only to score predictions,
+never supplied to the held-out behavior model. Weather uncertainty and probability intervals are
+provisional; future forecast and elapsed-time intervals are not claimed calibrated.
+
+Private Phase 3 reports and inspection artifacts live in `data/reports/`, including
+`phase3-report.md`, `weather-coverage.json`, `traffic-behavior.json`, and `model-comparison.json`.
+Phase 2 reports and models are preserved in `data/baseline_phase2/`. No new Python dependency is needed.

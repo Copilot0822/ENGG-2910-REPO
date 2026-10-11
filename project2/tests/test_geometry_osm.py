@@ -98,6 +98,7 @@ def test_stop_behavior_detection(profile, expected, settings):
     midpoint = len(points) // 2
     points.loc[midpoint, "control_kind"] = "stop"
     points.loc[midpoint, "control_id"] = "123:f"
+    points["map_confidence"] = 1.0  # Synthetic known control on the ridden road.
     observations = observe_events(points, route_events(points), "ride")
     assert observations[0]["behavior"] == expected
 
@@ -106,6 +107,7 @@ def test_signal_wait_stationary_not_moving(settings):
     points = annotate_network(trace([6] * 10 + [0] * 5 + [6] * 10, settings), {"elements": []})
     points.loc[12, "control_kind"] = "signal"
     points.loc[12, "control_id"] = "light:f"
+    points["map_confidence"] = 1.0
     observations = observe_events(points, route_events(points), "r1")
     assert observations[0]["stationary_s"] == 25
     behavior = BehaviorModel(observations * 10)
