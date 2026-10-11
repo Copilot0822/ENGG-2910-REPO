@@ -31,6 +31,19 @@ def main():
     predictor.add_argument("--hr", type=float)
     predictor.add_argument("--bike")
     predictor.add_argument(
+        "--journey-method",
+        choices=[
+            "automatic",
+            "CW+stops-auto",
+            "CW-auto",
+            "two-stage",
+            "bias-corrected",
+            "hybrid",
+            "hybrid-stops",
+        ],
+        default="automatic",
+    )
+    predictor.add_argument(
         "--model-variant",
         choices=["A", "B", "C", "CW"],
         help="Retained variant; default is traffic-aware C + Weather when trained",
@@ -73,7 +86,9 @@ def main():
     planning = sub.add_parser(
         "planning", help="Audit and train measured-HR, total duration and daylight planning"
     )
-    planning.add_argument("action", choices=["audit", "train", "validate", "percentages", "report"])
+    planning.add_argument(
+        "action", choices=["audit", "train", "validate", "percentages", "report", "phase5"]
+    )
     planning.add_argument("--archive", help="Optional original export for missing FIT timing metadata")
     planning.add_argument("--validation-rides", type=int)
     args = parser.parse_args()
@@ -171,6 +186,21 @@ def main():
                 settings.validation_rides = args.validation_rides
             if args.action == "audit":
                 summary = audit_history(store, settings, args.archive, progress)
+            elif args.action == "phase5":
+                from .phase5_validation import evaluate_phase5
+                from .journey import fit_phase5
+
+                report = evaluate_phase5(store, settings, progress)
+                fit_phase5(store, settings, report)
+                summary = {
+                    k: report[k]
+                    for k in (
+                        "selected_method",
+                        "recommended_method",
+                        "fresh_difference",
+                        "reused_difference",
+                    )
+                }
             elif args.action in ("train", "validate"):
                 summary = train_planning(
                     store, settings, progress, args.action == "validate", args.archive
@@ -251,6 +281,7 @@ def main():
                     args.daylight_reference,
                     args.safety_minutes,
                     manual_hr=args.hr is not None,
+                    journey_method=args.journey_method,
                 )
 
             result = candidate(args.departure)

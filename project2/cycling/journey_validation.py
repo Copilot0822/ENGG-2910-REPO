@@ -89,6 +89,10 @@ def _row(result, test, key, suggestion, osm_coverage, destination):
         "predicted_overall_kmh": result["overall_kmh"],
         "actual_moving_s": float(test.truth_moving_s),
         "predicted_moving_s": result["moving_s"],
+        "predicted_cruising_s": result.get("cruising_time_s"),
+        "predicted_moving_slowdown_s": result.get("moving_slowdown_s"),
+        "ascent_m": float(test.get("elevation_gain_m", 0)),
+        "paved_fraction": float(test.get("paved_fraction", 0)),
         "actual_rolling_kmh": speed_from_time(test.distance_m, test.truth_moving_s),
         "predicted_rolling_kmh": result["rolling_kmh"],
         "actual_stationary_s": float(test.total_stationary_s),
@@ -118,6 +122,8 @@ def _row(result, test, key, suggestion, osm_coverage, destination):
     if result.get("baseline_only"):
         for key in [
             "predicted_moving_s",
+            "predicted_cruising_s",
+            "predicted_moving_slowdown_s",
             "predicted_rolling_kmh",
             "predicted_traffic_s",
             "predicted_personal_s",

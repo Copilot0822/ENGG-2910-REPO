@@ -15,6 +15,7 @@ from .hr import mark_manual_hr, recommend_hr, update_hr_state, use_suggested_hr
 from .journey import load_planning, plan_ride
 from .pipeline import prepare_route, route_for_model
 from .stopping import route_features
+from .phase5_ui import phase5_performance
 
 
 def duration(seconds):
@@ -189,6 +190,34 @@ def route_prediction_page(store, settings, model):
     if daylight_reference == "civil_twilight":
         st.caption("Civil twilight provides reduced light and is not equivalent to full daylight.")
     with st.expander("Weather, model, timezone and elevation settings"):
+        st.selectbox(
+            "Total-duration method",
+            ["automatic", "CW+stops-auto", "CW-auto"]
+            + (
+                ["two-stage", "bias-corrected", "hybrid", "hybrid-stops"]
+                if planning.get("phase5")
+                else []
+            ),
+            key="journey_method",
+            format_func=lambda value: {
+                "automatic": "Automatic · use supported default",
+                "CW+stops-auto": "Existing residual stopping model",
+                "CW-auto": "C + Weather · no discretionary allowance",
+                "two-stage": "Two-stage stopping candidate",
+                "bias-corrected": "Bias-corrected elapsed candidate",
+                "hybrid": "Hybrid elapsed candidate",
+                "hybrid-stops": "Hybrid with two-stage stopping candidate",
+            }[value],
+        )
+        st.caption(
+            planning.get(
+                "selection_reason",
+                "Existing personalized stopping default. New methods become available after chronological validation.",
+            )
+        )
+        st.caption(
+            "Observed behavior matches historical elapsed validation. Full stops, manual HR, custom/minimal breaks and future forecasts are planning scenarios with provisional confidence."
+        )
         if choices:
             st.selectbox(
                 "Prediction model",
@@ -250,6 +279,7 @@ def route_prediction_page(store, settings, model):
                     daylight_reference,
                     safety,
                     st.session_state.get("hr_manual", False),
+                    journey_method=st.session_state.get("journey_method", "automatic"),
                 )
                 result["weather_forecast_enabled"] = forecast is not None
                 result["bike"] = None if bike == "Any / unknown" else bike
@@ -268,6 +298,7 @@ def route_prediction_page(store, settings, model):
                         break_minutes,
                         weather_neutral=True,
                         manual_hr=st.session_state.get("hr_manual", False),
+                        journey_method=st.session_state.get("journey_method", "automatic"),
                     )
                     result["neutral_comparison"] = {
                         k: comparator[k] for k in ("rolling_kmh", "moving_s", "elapsed_s")
@@ -303,12 +334,38 @@ def finish_results(result, route, store, settings):
     a, b, c, d = st.columns(4)
     a.metric("Estimated total ride time", duration(result["elapsed_s"]))
     b.metric("Expected finish time", pd.Timestamp(daylight["finish_local"]).strftime("%H:%M %Z"))
-    c.metric(
-        "Sunset at destination",
-        pd.Timestamp(daylight["sunset"]).strftime("%H:%M %Z") if daylight["sunset"] else "No sunset",
+    c.metric("Conservative finish time", clock(daylight.get("conservative_finish_local")))
+    margin = daylight.get("conservative_cutoff_margin_minutes")
+    d.metric(
+        "Conservative daylight margin", f"{margin:+.0f} min" if margin is not None else "Unavailable"
     )
-    remaining = daylight["remaining_daylight_minutes"]
-    d.metric("Remaining daylight", f"{remaining:+.0f} min" if remaining is not None else "Unavailable")
+    a, b, c = st.columns(3)
+    a.metric("Sunset at destination", clock(daylight["sunset"]))
+    b.metric("Daylight safety cutoff", clock(daylight["cutoff"]))
+    before = daylight.get("conservative_before_cutoff")
+    c.metric(
+        "Conservative finish before cutoff",
+        "Yes · provisional"
+        if before and result["elapsed_uncertainty"]["provisional"]
+        else "Yes"
+        if before
+        else "No"
+        if before is False
+        else "Unknown",
+    )
+    st.caption(
+        f"Total-duration method: {result.get('journey_method', 'existing stopping')} · {result.get('journey_choice_reason', '')}"
+    )
+    phase5 = store.get_state("phase5_validation", {})
+    if phase5:
+        metrics = next(
+            (m for m in phase5["fresh"]["comparisons"] if m["variant"] == result.get("journey_method")),
+            None,
+        )
+        if metrics:
+            st.caption(
+                f"Historical aggregate total-time MAPE {metrics['elapsed_mape']:.2f}% on {metrics['rides']} fresh later rides in observed traffic mode with automatic HR. This is not an error bound for this route or full-stop scenario."
+            )
     st.caption(
         f"Departure {clock(result['departure_utc'], zone)} · expected arrival {clock(daylight['finish_local'])} · destination timezone {zone}. Cutoff: {clock(daylight['cutoff'])}, including {daylight['safety_minutes']} min margin."
     )
@@ -360,6 +417,12 @@ def finish_results(result, route, store, settings):
             ],
         }
     )
+    correction = result.get("statistical_correction_s", 0)
+    if correction:
+        breakdown.loc[len(breakdown)] = ["Statistical total-duration adjustment", correction / 60]
+        st.write(
+            f"Physical ledger {duration(result['physical_elapsed_s'])}; statistical adjustment {correction / 60:+.1f} min. This adjustment contains interruption and riding-model bias, rather than a measured stop."
+        )
     st.plotly_chart(
         px.bar(breakdown, x="Minutes", y="Component", orientation="h", title="Complete time ledger"),
         width="stretch",
@@ -378,7 +441,7 @@ def finish_results(result, route, store, settings):
         frame,
         x="Distance (km)",
         y="Expected clock time",
-        title=f"Expected route progress · clock in {zone}",
+        title=f"Physical route progress · clock in {zone}",
     )
     for name, value in [
         ("Sunset", daylight["sunset"]),
@@ -393,6 +456,10 @@ def finish_results(result, route, store, settings):
     st.caption(
         "Personal stopping is an expected distribution across broad progress bands, not predicted café or bathroom locations."
     )
+    if correction:
+        st.caption(
+            "The statistical total-duration adjustment is unallocated. This physical progress chart and checkpoints exclude it; use the adjusted headline and conservative finish for daylight decisions."
+        )
     checkpoints = np.arange(25, result["distance_m"] / 1000, 25)
     if len(checkpoints):
         elapsed = np.interp(
@@ -457,6 +524,7 @@ def finish_results(result, route, store, settings):
                 daylight["reference"],
                 daylight["safety_minutes"],
                 result.get("hr_selection") == "manual override",
+                journey_method=result.get("journey_method_requested", "automatic"),
             )
 
         with st.spinner("Recalculating candidate departures with changing weather and traffic…"):
@@ -472,6 +540,10 @@ def finish_results(result, route, store, settings):
 
 
 def elapsed_performance(store):
+    phase5 = store.get_state("phase5_validation", {})
+    if phase5.get("status") == "complete":
+        phase5_performance(phase5, store)
+        return
     from .accuracy import MODEL_LABELS, PRIMARY_VARIANTS
     from .journey_validation import DISTANCE_LABELS, distance_group, percentage_report
 

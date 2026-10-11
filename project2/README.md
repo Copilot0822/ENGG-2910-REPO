@@ -541,3 +541,60 @@ MAPE is descriptive and does not retune or switch the configured C+Weather defau
 requested `planning validate` selects stopping candidates by MAPE on **earlier selection folds only**,
 before independent final scoring. It does not use final-set rankings for selection. Private Phase 4.1
 delivery results are in `data/reports/phase4.1-report.md`.
+
+## Phase 5: stopping, corrected elapsed duration and scenario confidence
+
+The standalone project environment remains `project2/.venv`; all commands use `uv`.
+Run the application from this directory with `uv run streamlit run app.py`.
+
+`uv run cycling planning phase5` runs the earlier chronological selection, expanding-window
+nested assessment, reused 32-ride benchmark and fresh later complementary comparisons, then
+saves `data/models/journey-phase5.joblib`. This separate artifact preserves the original
+journey and A/B/C/C+Weather models. The private protocol and frozen family choices are written
+before later candidate errors are evaluated. MAPE chooses parameters; a predeclared paired
+fresh-data improvement gate controls a default change. The old benchmark is explicitly reused.
+Fresh complementary rides are mostly short, so improvement there does not establish long-ride skill.
+
+The optional **Total-duration method** selector keeps the existing stopping model accessible
+and exposes two-stage stopping, bias correction and hybrid candidates. Automatic uses the
+supported release decision and explains its choice. The stopping model uses soft labels for
+meaningful unattributed dwell, excludes unobserved gaps, and evaluates robust conditional
+means and medians. These quantities estimate stopping behavior; they cannot identify personal
+intent or distinguish all unmapped traffic. The median candidate is a robust point allowance,
+not an uncapped arithmetic expectation.
+
+Corrections use only earlier out-of-sample predictions. Direct blending combines complete
+durations, including stops once. Route-relative and regularized residual alternatives are
+retained in private selection diagnostics. Statistical adjustments appear as a separate signed
+quantity: physical cruising, moving losses, traffic waits and the break allowance remain visible.
+Segment progress retains the physical ledger; an unallocated correction changes the total finish,
+not fabricated segment stops. Custom breaks replace the automatic allowance, and minimal mode
+retains traffic without personal breaks. Both disable historical total-duration corrections.
+
+Validation describes **observed** traffic behavior, automatic suggested HR, historical breaks
+and observed external weather. Full stops, manual HR, changed breaks and future forecasts are
+planning scenarios with provisional reference intervals. Manual HR never selects retrospective
+actual-measured-HR calibration. Conservative finish estimates use asymmetric finite-order
+chronological residuals, pooling sparse comparable distances. Chronological dependence and drift
+prevent claiming a conformal coverage guarantee; coverage is measured prequentially. Before-dark
+probabilities remain withheld when evidence or scenario calibration is inadequate.
+
+Model Performance compares cohorts, old/new models, distance groups, underprediction severity,
+interval coverage and optimistic cutoff errors. Its inspector exposes actual versus estimated
+components, HR, ascent, paved fraction, correction, and map/weather coverage. Results lead with
+total duration, expected/conservative finish, cutoff and conservative margin.
+
+Examples:
+
+```powershell
+uv run cycling predict your-route.gpx --departure 2026-10-12T09:00:00-04:00 --forecast
+uv run cycling predict your-route.gpx --departure 2026-10-12T09:00:00-04:00 --hr 140 --break-mode custom --break-minutes 20
+uv run cycling predict your-route.gpx --departure 2026-10-12T09:00:00-04:00 --journey-method hybrid-stops --scenario observed
+uv run pytest -q
+uv run ruff check cycling tests
+uv run ruff format --check cycling tests app.py
+```
+
+Private detailed results are in `data/reports/phase5-report.md`, `phase5-validation.json/.csv`,
+`phase5-initial-diagnostics.md`, and `phase5-initial-ledger.csv`. Original models/reports are
+copied to `data/baseline_phase5/` with hashes. All recordings, caches and artifacts remain ignored.

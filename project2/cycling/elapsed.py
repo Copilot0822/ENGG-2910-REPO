@@ -17,7 +17,7 @@ class ElapsedCalibration:
     ):
         rows = pd.DataFrame(self.rows)
         if departure is not None and len(rows):
-            rows = rows[pd.to_datetime(rows.date, utc=True) < pd.Timestamp(departure)]
+            rows = rows[pd.to_datetime(rows.date, utc=True, format="mixed") < pd.Timestamp(departure)]
         warnings = []
         if len(rows):
             group = rows[rows.distance_km.ge(100) == (distance_km >= 100)]

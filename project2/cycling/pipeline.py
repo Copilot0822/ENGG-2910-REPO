@@ -202,6 +202,7 @@ def train(store, settings, progress=None, validate=True):
         },
     )
     store.set_state("model_stale", False)
+    store.set_state("phase5_stale", True)
     if progress:
         progress(1, "Training complete")
     return model
