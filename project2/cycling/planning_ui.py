@@ -472,34 +472,296 @@ def finish_results(result, route, store, settings):
 
 
 def elapsed_performance(store):
-    st.title("Elapsed-time performance")
-    report = store.get_state("journey_validation")
+    from .accuracy import MODEL_LABELS, PRIMARY_VARIANTS
+    from .journey_validation import DISTANCE_LABELS, distance_group, percentage_report
+
+    st.title("Percentage-based elapsed-time accuracy")
+    report = percentage_report(store.get_state("journey_validation", {}))
     quality = store.get_state("timing_quality", {})
     st.caption(
         f"Reliable complete duration: {quality.get('reliable_elapsed', 0)} of {quality.get('rides', 0)} rides. Reliable measured-HR recommendation evidence: {quality.get('reliable_measured_hr', 0)} rides."
     )
-    if not report:
+    if not report or not report.get("rows"):
         st.info(
             "Train and validate elapsed planning on Historical Data to evaluate complete finishing time."
         )
         return
     comparison = pd.DataFrame(report["comparisons"])
-    primary = comparison[comparison.variant.eq("CW+stops-auto")].iloc[0]
+    variants = comparison.variant.tolist()
+    diagnostic = st.selectbox(
+        "Elapsed diagnostic model",
+        variants,
+        index=variants.index("CW+stops-auto") if "CW+stops-auto" in variants else 0,
+        format_func=lambda value: MODEL_LABELS.get(value, value),
+    )
+    primary = comparison[comparison.variant.eq(diagnostic)].iloc[0]
+
+    def pct(value, signed=False):
+        return (
+            "Unavailable"
+            if value is None or pd.isna(value)
+            else f"{value:+.1f}%"
+            if signed
+            else f"{value:.1f}%"
+        )
+
+    def percentage_table(values, label):
+        frame = pd.DataFrame(values)
+        return frame.reindex(
+            columns=[
+                label,
+                "rides",
+                "elapsed_mape",
+                "elapsed_mdape",
+                "elapsed_mspe",
+                "elapsed_p90_ape",
+            ]
+        ).rename(
+            columns={
+                "rides": "Evaluated rides",
+                "elapsed_mape": "MAPE (%)",
+                "elapsed_mdape": "Median APE (%)",
+                "elapsed_mspe": "Signed bias (%)",
+                "elapsed_p90_ape": "P90 APE (%)",
+            }
+        )
+
+    st.caption(
+        f"Accuracy model: {MODEL_LABELS.get(diagnostic, diagnostic)}. The initial view is the current C+Weather + stopping planning model."
+    )
     a, b, c = st.columns(3)
-    a.metric("Total elapsed-time MAE", f"{primary.elapsed_mae_minutes:.1f} min")
-    b.metric("Median absolute elapsed error", f"{primary.median_absolute_elapsed_minutes:.1f} min")
-    c.metric("Elapsed bias", f"{primary.elapsed_bias_minutes:+.1f} min")
-    st.dataframe(comparison, hide_index=True, width="stretch")
+    a.metric("Total Elapsed-Time MAPE (%)", pct(primary.elapsed_mape))
+    b.metric("Median absolute percentage error", pct(primary.elapsed_mdape))
+    c.metric("Signed percentage bias", pct(primary.elapsed_mspe, signed=True))
+    a, b, c = st.columns(3)
+    a.metric("P90 absolute percentage error", pct(primary.elapsed_p90_ape))
+    b.metric("Rides underestimated", pct(primary.underprediction_percentage))
+    c.metric("Total evaluated rides", int(primary.rides))
+    st.caption(
+        "MAPE averages one absolute percentage error per ride using that ride's actual total duration. "
+        "Negative signed bias means optimistic early finishes; positive means durations are overstated. "
+        "Median APE describes the typical middle error, while MAPE includes every eligible error."
+    )
+    st.info(
+        "P90 APE is a historical error percentile, not a calibrated 90% prediction interval or a before-dark guarantee. "
+        "MAPE is not a ± confidence range. Daylight planning retains the independently calibrated asymmetric elapsed intervals."
+    )
+    cohort = report["percentage_comparison_cohort"]
+    st.subheader("Same-ride model comparison")
+    main = comparison[comparison.variant.isin(PRIMARY_VARIANTS)].copy()
+    main["Model"] = main.variant.map(MODEL_LABELS)
+    summary = percentage_table(main, "Model")
+    st.dataframe(summary, hide_index=True, width="stretch")
+    if main.elapsed_mape.notna().any():
+        st.plotly_chart(
+            px.bar(
+                summary,
+                x="Model",
+                y="MAPE (%)",
+                hover_data=["Evaluated rides", "Median APE (%)", "Signed bias (%)", "P90 APE (%)"],
+                title="Total elapsed-time MAPE · identical held-out rides",
+            ),
+            width="stretch",
+        )
+    ranking = report["percentage_ranking"]
+    if ranking["lowest_mape_variant"]:
+        st.write(
+            f"Lowest final-set MAPE: **{MODEL_LABELS[ranking['lowest_mape_variant']]}**. "
+            f"Lowest minute MAE: **{MODEL_LABELS[ranking['lowest_minute_mae_variant']]}**. "
+            f"{'The rankings differ.' if ranking['winners_differ'] else 'Both criteria select the same observed winner.'}"
+        )
+    default = comparison[comparison.variant.eq("CW+stops-auto")]
     baseline = comparison[comparison.variant.eq("simple-elapsed")]
-    if len(baseline) and primary.elapsed_mae_minutes > baseline.elapsed_mae_minutes.iloc[0]:
+    if (
+        len(default)
+        and len(baseline)
+        and pd.notna(default.elapsed_mape.iloc[0])
+        and pd.notna(baseline.elapsed_mape.iloc[0])
+        and default.elapsed_mape.iloc[0] > baseline.elapsed_mape.iloc[0]
+    ):
         st.warning(
-            f"The learned elapsed model did not beat the simple duration baseline on these final rides ({primary.elapsed_mae_minutes:.1f} versus {baseline.elapsed_mae_minutes.iloc[0]:.1f} min MAE). The C+Weather default is retained; greater complexity has not established superior overall accuracy."
+            f"The deployed stopping model did not beat the simple baseline in percentage accuracy "
+            f"({default.elapsed_mape.iloc[0]:.2f}% versus {baseline.elapsed_mape.iloc[0]:.2f}% MAPE). "
+            "C+Weather and the configured stopping allowance are retained; the final-set ranking does not retune or replace them."
         )
     st.caption(
-        f"{report['final_rides']} same final route/departure folds; metrics exclude unreliable durations identically. Model selection used {report['selection_rides']} earlier rides ending {report['selection_last'][:10]}. Each effort suggestion, fit and calibration sees only earlier activities."
+        f"{cohort['evaluated_rides']} of {cohort['candidate_rides']} saved final rides are shared by all four primary models. "
+        f"{len(cohort['excluded_rides'])} rides excluded from this paired comparison. "
+        "Unreliable, nonpositive/nonfinite actual durations, invalid predictions and missing model predictions are explicitly audited."
+    )
+    if cohort["excluded_rides"]:
+        st.dataframe(pd.DataFrame(cohort["excluded_rides"]), hide_index=True, width="stretch")
+    st.caption(
+        f"Model selection used {report['selection_rides']} earlier folds ending {report['selection_last'][:10]} "
+        f"with {'per-ride MAPE' if report.get('stopping_selection_metric') == 'elapsed_mape' else 'minute-based MAE'}. "
+        "Final percentages are reporting only. Each effort suggestion, fit and calibration sees only earlier activities."
     )
     st.caption(report["weather_evaluation"])
     st.warning(report["probability_note"])
+
+    st.subheader("Underprediction · late-arrival risk")
+    a, b, c = st.columns(3)
+    a.metric("Underpredicted rides", f"{int(primary.underpredicted_rides)} / {int(primary.rides)}")
+    b.metric("Mean underprediction", pct(primary.underprediction_mape))
+    c.metric("Median underprediction", pct(primary.underprediction_median_percentage))
+    a, b, c = st.columns(3)
+    a.metric("Largest underprediction", pct(primary.underprediction_max_percentage))
+    b.metric("P90 underprediction", pct(primary.underprediction_p90_percentage))
+    c.metric("P90 late-arrival error · all rides", pct(primary.late_arrival_p90_percentage))
+    st.caption(
+        "Underprediction magnitudes are positive percentages of actual duration, conditional on underestimated rides. "
+        "All-ride late-arrival P90 assigns zero to overestimated/exact rides. Opposite-direction errors never cancel these magnitudes."
+    )
+
+    st.subheader("Percentage error by distance")
+    groups = percentage_table(
+        [{"Distance group": key, **value} for key, value in report["groups"][diagnostic].items()],
+        "Distance group",
+    )
+    st.dataframe(groups, hide_index=True, width="stretch")
+    if groups["MAPE (%)"].notna().any():
+        st.plotly_chart(
+            px.bar(
+                groups,
+                x="Distance group",
+                y="MAPE (%)",
+                hover_data=["Evaluated rides", "Median APE (%)", "Signed bias (%)", "P90 APE (%)"],
+                title=f"MAPE by distance · {MODEL_LABELS.get(diagnostic, diagnostic)}",
+            ),
+            width="stretch",
+        )
+    st.caption(
+        "Counts accompany every subgroup. Groups with only a few rides do not establish statistical confidence."
+    )
+    st.subheader("Percentage error by actual ride duration")
+    st.dataframe(
+        percentage_table(
+            [
+                {"Actual duration": key, **value}
+                for key, value in report["duration_groups"][diagnostic].items()
+            ],
+            "Actual duration",
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+
+    rows = pd.DataFrame(report["rows"])
+    selected = rows[rows.variant.eq(diagnostic)].copy()
+    selected["Actual elapsed (hours)"] = selected.actual_elapsed_s / 3600
+    if selected.percentage_eligible.any():
+        st.plotly_chart(
+            px.scatter(
+                selected[selected.percentage_eligible],
+                x="Actual elapsed (hours)",
+                y="absolute_percentage_error",
+                hover_data=["date", "distance_km", "signed_percentage_error"],
+                labels={
+                    "absolute_percentage_error": "Absolute percentage error (%)",
+                    "signed_percentage_error": "Signed error (%)",
+                },
+                title="Per-ride percentage error versus actual duration",
+            ),
+            width="stretch",
+        )
+    selected["Distance group"] = selected.distance_km.map(distance_group)
+    distance_filter = st.selectbox(
+        "Validation distance group", ["All distance groups"] + DISTANCE_LABELS
+    )
+    if distance_filter != "All distance groups":
+        selected = selected[selected["Distance group"].eq(distance_filter)]
+    selected["Actual elapsed (min)"] = selected.actual_elapsed_s / 60
+    selected["Predicted elapsed (min)"] = selected.predicted_elapsed_s / 60
+    selected["Signed error (min)"] = (selected.predicted_elapsed_s - selected.actual_elapsed_s) / 60
+    selected["Model"] = selected.variant.map(MODEL_LABELS)
+    selected = selected.sort_values("absolute_percentage_error", ascending=False, na_position="last")
+    st.subheader("Individual held-out rides · largest percentage error first")
+    view = selected.reindex(
+        columns=[
+            "date",
+            "distance_km",
+            "Distance group",
+            "Actual elapsed (min)",
+            "Predicted elapsed (min)",
+            "signed_percentage_error",
+            "absolute_percentage_error",
+            "actual_overall_kmh",
+            "predicted_overall_kmh",
+            "Model",
+            "prediction_direction",
+            "actual_finish_utc",
+            "predicted_finish_utc",
+            "Signed error (min)",
+            "percentage_eligible",
+            "paired_comparison_eligible",
+            "percentage_exclusion_reason",
+        ]
+    ).rename(
+        columns={
+            "date": "Departure (UTC)",
+            "distance_km": "Ride distance (km)",
+            "signed_percentage_error": "Signed error (%)",
+            "absolute_percentage_error": "Absolute error (%)",
+            "actual_overall_kmh": "Actual overall speed (km/h)",
+            "predicted_overall_kmh": "Predicted overall speed (km/h)",
+            "prediction_direction": "Estimate direction",
+            "actual_finish_utc": "Actual finish (UTC)",
+            "predicted_finish_utc": "Predicted finish (UTC)",
+            "percentage_eligible": "Percentage calculable",
+            "paired_comparison_eligible": "In primary paired comparison",
+            "percentage_exclusion_reason": "Exclusion reason",
+        }
+    )
+    st.dataframe(view, hide_index=True, width="stretch")
+    st.caption(
+        "Use the model selector and distance filter above; click table headers to change the sort. Excluded rows remain visible with reasons. Finish timestamps are departure plus the saved actual/predicted duration."
+    )
+    st.download_button(
+        "Download filtered percentage validation",
+        view.to_csv(index=False),
+        "elapsed-percentage-validation.csv",
+        "text/csv",
+    )
+    with st.expander("Secondary minute errors, daylight and component diagnostics"):
+        st.dataframe(
+            comparison.reindex(
+                columns=[
+                    "variant",
+                    "rides",
+                    "elapsed_mae_minutes",
+                    "median_absolute_elapsed_minutes",
+                    "elapsed_bias_minutes",
+                    "overall_speed_mae_kmh",
+                    "coverage_80",
+                    "coverage_90",
+                    "daylight_accuracy",
+                    "optimistic_daylight_errors",
+                ]
+            ),
+            hide_index=True,
+            width="stretch",
+        )
+        st.dataframe(
+            selected.drop(columns=["warnings", "hr_training_ids"], errors="ignore"),
+            hide_index=True,
+            width="stretch",
+        )
+        if selected.percentage_eligible.any():
+            st.plotly_chart(
+                px.scatter(
+                    selected[selected.percentage_eligible],
+                    x="Actual elapsed (min)",
+                    y="Predicted elapsed (min)",
+                    hover_data=["date", "distance_km"],
+                    title="Complete duration · chronological held-out rides",
+                ),
+                width="stretch",
+            )
+        st.caption(
+            "Moving, traffic-attribution and unattributed-stop errors are accounting diagnostics; they do not establish causal effects of fatigue, weather or rider intent."
+        )
+
+    st.subheader("Automatic HR recommendation diagnostics")
     hr = report["hr_metrics"]
     a, b, c = st.columns(3)
     a.metric(
@@ -516,45 +778,9 @@ def elapsed_performance(store):
         f"HR recency half-life selected separately: {report['selected_hr_half_life']} days. Stopping approach: {report['selected_stopping_method']}."
     )
     st.subheader("Automatic versus known measured HR · paired eligible rides")
-    st.dataframe(pd.DataFrame(report["measured_hr_comparisons"]), hide_index=True, width="stretch")
-    diagnostic = st.selectbox(
-        "Elapsed diagnostic model",
-        comparison.variant.tolist(),
-        index=comparison.variant.tolist().index("CW+stops-auto"),
-    )
-    st.dataframe(
-        pd.DataFrame(
-            [{"Distance group": key, **value} for key, value in report["groups"][diagnostic].items()]
-        ),
-        hide_index=True,
-        width="stretch",
-    )
-    rows = pd.DataFrame(report["rows"])
-    selected = rows[rows.variant.eq(diagnostic)].copy()
-    selected["Actual elapsed (min)"] = selected.actual_elapsed_s / 60
-    selected["Predicted elapsed (min)"] = selected.predicted_elapsed_s / 60
-    st.plotly_chart(
-        px.scatter(
-            selected[selected.elapsed_reliable],
-            x="Actual elapsed (min)",
-            y="Predicted elapsed (min)",
-            hover_data=["date", "distance_km"],
-            title="Complete duration · chronological held-out rides",
-        ),
-        width="stretch",
-    )
-    selected["Signed error (min)"] = selected.elapsed_error_s / 60
-    selected["Absolute error (min)"] = selected.absolute_elapsed_error_s / 60
-    st.dataframe(
-        selected.drop(columns=["warnings", "hr_training_ids"], errors="ignore").sort_values(
-            "Absolute error (min)", ascending=False
-        ),
-        hide_index=True,
-        width="stretch",
-    )
-    st.caption(
-        "Click table headers to sort. Moving, traffic-attribution and unattributed-stop errors are accounting diagnostics; they do not establish causal effects of fatigue, weather or rider intent."
-    )
+    measured = pd.DataFrame(report["measured_hr_comparisons"])
+    measured["Model"] = measured.variant.map(MODEL_LABELS)
+    st.dataframe(percentage_table(measured, "Model"), hide_index=True, width="stretch")
     with st.expander("Selection candidates and HR distance-group accuracy"):
         st.dataframe(pd.DataFrame(report["stopping_candidates"]), hide_index=True, width="stretch")
         st.dataframe(pd.DataFrame(report["hr_candidates"]), hide_index=True, width="stretch")

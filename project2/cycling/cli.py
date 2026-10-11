@@ -73,7 +73,7 @@ def main():
     planning = sub.add_parser(
         "planning", help="Audit and train measured-HR, total duration and daylight planning"
     )
-    planning.add_argument("action", choices=["audit", "train", "validate", "report"])
+    planning.add_argument("action", choices=["audit", "train", "validate", "percentages", "report"])
     planning.add_argument("--archive", help="Optional original export for missing FIT timing metadata")
     planning.add_argument("--validation-rides", type=int)
     args = parser.parse_args()
@@ -176,12 +176,20 @@ def main():
                     store, settings, progress, args.action == "validate", args.archive
                 )
             else:
-                report = store.get_state("journey_validation", {})
+                from .journey_validation import percentage_report, refresh_percentage_reporting
+
+                report = (
+                    refresh_percentage_reporting(store)
+                    if args.action == "percentages"
+                    else percentage_report(store.get_state("journey_validation", {}))
+                )
                 summary = {
                     "training": store.get_state("journey_training"),
                     "timing": store.get_state("timing_quality"),
                     "comparisons": report.get("comparisons"),
                     "hr_metrics": report.get("hr_metrics"),
+                    "percentage_comparison_cohort": report.get("percentage_comparison_cohort"),
+                    "percentage_ranking": report.get("percentage_ranking"),
                 }
         elif args.command == "train":
             settings.optimize_half_life = args.optimize_half_life or settings.optimize_half_life

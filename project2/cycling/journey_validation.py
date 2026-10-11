@@ -1,6 +1,7 @@
 """Paired prequential elapsed backtests; effort and stop models see only the past."""
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
@@ -10,6 +11,14 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from .accuracy import (
+    DURATION_LABELS,
+    PRIMARY_VARIANTS,
+    duration_group,
+    paired_percentage_rows,
+    percentage_metrics,
+    percentage_rows,
+)
 from .comparison import comparison_folds
 from .daylight import daylight_plan
 from .elapsed import ElapsedCalibration
@@ -268,35 +277,43 @@ def _run(
 
 
 def elapsed_metrics(rows):
-    frame = pd.DataFrame(rows)
-    frame = frame[frame.elapsed_reliable] if len(frame) else frame
+    percentages = percentage_metrics(rows)
+    frame = percentage_rows(rows)
+    frame = frame[frame.percentage_eligible]
     if frame.empty:
-        return {"rides": 0, "elapsed_mae_minutes": None}
-    error = frame.elapsed_error_s
-    cutoff = frame[frame.actual_before_cutoff.notna()]
-    predicted_daylight = cutoff.predicted_before_cutoff.astype(bool)
-    actual_daylight = cutoff.actual_before_cutoff.astype(bool)
-    moving_errors = (frame.predicted_moving_s - frame.actual_moving_s).abs().dropna()
-    rolling_errors = (frame.predicted_rolling_kmh - frame.actual_rolling_kmh).abs().dropna()
+        return {**percentages, "elapsed_mae_minutes": None}
+
+    def numeric(name):
+        return pd.to_numeric(frame.get(name, pd.Series(np.nan, index=frame.index)), errors="coerce")
+
+    error = numeric("predicted_elapsed_s") - numeric("actual_elapsed_s")
+    actual_daylight = frame.get("actual_before_cutoff", pd.Series(None, index=frame.index))
+    predicted_daylight = frame.get("predicted_before_cutoff", pd.Series(None, index=frame.index))
+    usable = actual_daylight.notna() & predicted_daylight.notna()
+    actual_daylight, predicted_daylight = (
+        actual_daylight[usable].astype(bool),
+        predicted_daylight[usable].astype(bool),
+    )
+    moving_errors = (numeric("predicted_moving_s") - numeric("actual_moving_s")).abs().dropna()
+    rolling_errors = (numeric("predicted_rolling_kmh") - numeric("actual_rolling_kmh")).abs().dropna()
     result = {
-        "rides": len(frame),
+        **percentages,
         "elapsed_mae_minutes": float(error.abs().mean() / 60),
         "median_absolute_elapsed_minutes": float(error.abs().median() / 60),
         "elapsed_bias_minutes": float(error.mean() / 60),
         "overall_speed_mae_kmh": float(
-            (frame.predicted_overall_kmh - frame.actual_overall_kmh).abs().mean()
-        ),
-        "elapsed_mape": float((error.abs() / frame.actual_elapsed_s).mean() * 100),
+            (numeric("predicted_overall_kmh") - numeric("actual_overall_kmh")).abs().mean()
+        )
+        if numeric("predicted_overall_kmh").notna().any()
+        else None,
         "moving_mae_minutes": float(moving_errors.mean() / 60) if len(moving_errors) else None,
         "rolling_mae_kmh": float(rolling_errors.mean()) if len(rolling_errors) else None,
-        "daylight_rides": len(cutoff),
-        "daylight_accuracy": float(
-            (cutoff.actual_before_cutoff == cutoff.predicted_before_cutoff).mean()
-        )
-        if len(cutoff)
+        "daylight_rides": len(actual_daylight),
+        "daylight_accuracy": float((actual_daylight == predicted_daylight).mean())
+        if len(actual_daylight)
         else None,
         "optimistic_daylight_errors": int((predicted_daylight & ~actual_daylight).sum())
-        if len(cutoff)
+        if len(actual_daylight)
         else 0,
     }
     for coverage in (80, 90):
@@ -305,6 +322,114 @@ def elapsed_metrics(rows):
         result[f"coverage_{coverage}"] = float(values.mean()) if len(values) else None
         result[f"coverage_{coverage}_rides"] = len(values)
     return result
+
+
+def select_stopping_method(selection_rows):
+    """Only earlier selection folds choose a method, now by per-ride MAPE."""
+    candidates = [
+        {
+            "method": method,
+            **elapsed_metrics(
+                [
+                    row
+                    for row in selection_rows
+                    if row.get("split") == "selection" and row["variant"] == f"candidate-{method}"
+                ]
+            ),
+        }
+        for method in METHODS
+    ]
+    eligible = [candidate for candidate in candidates if candidate["elapsed_mape"] is not None]
+    if not eligible:
+        raise ValueError("No valid earlier selection durations for stopping-model selection.")
+    return min(eligible, key=lambda candidate: candidate["elapsed_mape"])["method"], candidates
+
+
+def percentage_report(report):
+    """Re-score saved predictions, preserving selection, fits and calibration."""
+    result = deepcopy(report)
+    if not result.get("rows"):
+        return result
+    frame, cohort = paired_percentage_rows(result["rows"])
+    rows = frame.to_dict("records")
+    for row in rows:
+        for key, value in row.items():
+            if isinstance(value, float) and not np.isfinite(value):
+                row[key] = None
+    result["rows"] = rows
+
+    def scored(key):
+        return [
+            row
+            for row in rows
+            if row["variant"] == key
+            and (key not in PRIMARY_VARIANTS or row["paired_comparison_eligible"])
+        ]
+
+    keys = list(PRIMARY_VARIANTS) + sorted(set(frame.variant) - set(PRIMARY_VARIANTS))
+    result["comparisons"] = [{"variant": key, **elapsed_metrics(scored(key))} for key in keys]
+    result["groups"] = {
+        key: {
+            label: elapsed_metrics(
+                [row for row in scored(key) if distance_group(row["distance_km"]) == label]
+            )
+            for label in DISTANCE_LABELS
+        }
+        for key in keys
+    }
+    result["duration_groups"] = {
+        key: {
+            label: elapsed_metrics(
+                [
+                    row
+                    for row in scored(key)
+                    if row["percentage_eligible"] and duration_group(row["actual_elapsed_s"]) == label
+                ]
+            )
+            for label in DURATION_LABELS
+        }
+        for key in keys
+    }
+    measured_ids = {
+        row["id"] for row in rows if row["variant"] == "CW+stops-known" and row["percentage_eligible"]
+    }
+    result["measured_hr_comparisons"] = [
+        {"variant": key, **elapsed_metrics([row for row in scored(key) if row["id"] in measured_ids])}
+        for key in ("CW-auto", "CW-known", "CW+stops-auto", "CW+stops-known")
+    ]
+    eligible = [r for r in result["comparisons"] if r["variant"] in PRIMARY_VARIANTS and r["rides"]]
+    mape_winner = min(eligible, key=lambda r: r["elapsed_mape"])["variant"] if eligible else None
+    minute_winner = (
+        min(eligible, key=lambda r: r["elapsed_mae_minutes"])["variant"] if eligible else None
+    )
+    result["percentage_comparison_cohort"] = cohort
+    result["primary_accuracy_metric"] = "elapsed_mape"
+    result["percentage_ranking"] = {
+        "lowest_mape_variant": mape_winner,
+        "lowest_minute_mae_variant": minute_winner,
+        "winners_differ": mape_winner != minute_winner if eligible else None,
+        "note": "Final-set ranking is descriptive, not hyperparameter selection. Existing deployed models and C+Weather default are retained.",
+    }
+    result.setdefault("stopping_selection_metric", "elapsed_mae_minutes")
+    result["percentage_method"] = (
+        "One absolute/signed percentage per valid ride, divided by its actual elapsed duration, then averaged. "
+        "P90 uses linear empirical quantile interpolation; it is an error statistic, not a prediction interval. "
+        "Underprediction magnitudes are positive; their conditional P90 excludes overpredicted/exact rides, "
+        "whereas late-arrival P90 over all rides assigns zero to those rides."
+    )
+    return result
+
+
+def refresh_percentage_reporting(store):
+    report = percentage_report(store.get_state("journey_validation", {}))
+    if not report.get("rows"):
+        raise ValueError("No saved elapsed validation predictions. Validate planning first.")
+    store.set_state("journey_validation", report)
+    (store.root / "reports/journey-validation.json").write_text(
+        json.dumps(report, indent=2, allow_nan=False), encoding="utf-8"
+    )
+    pd.DataFrame(report["rows"]).to_csv(store.root / "reports/journey-validation.csv", index=False)
+    return report
 
 
 def run_validation(store, settings, progress=None):
@@ -404,11 +529,7 @@ def run_validation(store, settings, progress=None):
         selection_rows.append(row)
         if test.elapsed_reliable:
             residual_pool.append(item["residual"])
-    stopping_candidates = []
-    for method in METHODS:
-        metric = elapsed_metrics([r for r in selection_rows if r["variant"] == f"candidate-{method}"])
-        stopping_candidates.append({"method": method, **metric})
-    selected = min(stopping_candidates, key=lambda r: r["elapsed_mae_minutes"])["method"]
+    selected, stopping_candidates = select_stopping_method(selection_rows)
     results = _run(
         final,
         store,
@@ -505,6 +626,7 @@ def run_validation(store, settings, progress=None):
         },
         "hr_rows": hr_rows,
         "selected_stopping_method": selected,
+        "stopping_selection_metric": "elapsed_mape",
         "stopping_candidates": stopping_candidates,
         "selection_last": max(str(t.date) for _, _, t in selection),
         "final_first": boundary.isoformat(),
@@ -526,6 +648,7 @@ def run_validation(store, settings, progress=None):
         "speed_halves": halves,
         "timing_quality": store.get_state("timing_quality"),
     }
+    report = percentage_report(report)
     store.set_state("journey_validation", report)
     destination = store.root / "reports/journey-validation.json"
     destination.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")

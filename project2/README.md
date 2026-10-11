@@ -41,7 +41,7 @@ downloaded automatically by uv when needed. No Docker, account credentials or AP
    Download private prediction data if desired. Personal stops are distributed across broad progress
    bands for timing, without predicting exact stopping locations. Latest departure recalculates candidate
    departure times with changing weather/traffic rather than subtracting one fixed duration.
-4. **Model Performance:** complete elapsed error and automatic-HR accuracy are the headlines.
+4. **Model Performance:** total elapsed-time MAPE (%) and automatic-HR accuracy are the headlines.
    Inspect chronological errors, baseline comparisons, recency candidates,
    recent-fitness comparison, uncertainty coverage, data coverage, and errors by distance/surface/
    elevation. More features do not guarantee better accuracy; the dashboard explicitly reports
@@ -501,3 +501,43 @@ invented sunset. Default cutoff is sunset minus 30 minutes. Civil twilight is re
 Private results are written to `data/reports/journey-validation.json`, `journey-validation.csv`,
 `timing-quality.json`, and `phase4-report.md`. `data/models/journey.joblib` contains the fitted stopping and
 elapsed-calibration layer. Prior Phase 3 reports are preserved in `data/baseline_phase3/`.
+
+## Phase 4.1: percentage-based total-time accuracy
+
+Model Performance leads with total elapsed-time **MAPE**, median absolute percentage error (MdAPE),
+mean signed percentage error (MSPE), P90 absolute percentage error, underprediction frequency and ride count.
+For each eligible held-out ride, absolute percentage error is `100 * abs(predicted - actual) / actual`;
+MAPE is the arithmetic mean of these individual values. It is **not** minute MAE divided by average duration,
+nor the percentage improvement between two MAEs. Each eligible ride has equal weight. Signed errors use
+`100 * (predicted - actual) / actual`: negative means a predicted finish that is too early.
+
+The four primary models use exactly the same eligible ride IDs. Exclusions for unreliable, nonpositive or
+nonfinite actual duration, invalid predictions, missing counterparts and inconsistent actual durations are
+shown explicitly; difficult valid rides are retained. An empty subgroup shows unavailable metrics rather than
+invented zeros. Known-HR comparisons remain a separately paired eligible subset.
+
+Underprediction magnitude statistics are conditional on underpredicted rides and use positive percentages
+of actual duration. The separate all-ride late-arrival P90 includes zero for overpredicted/exact rides.
+P90 APE uses NumPy's linear empirical quantile interpolation; it is an error statistic, **not** the calibrated
+90% duration interval or an arriving-before-dark guarantee. No ±MAPE interval is constructed. Existing
+asymmetric duration calibration, conservative finish times, sunlight calculations and prediction defaults
+are retained.
+
+Percentage-axis charts compare models and distance groups. Duration groups and a per-ride scatter also show
+how errors vary with actual elapsed time. The validation table defaults to largest APE first, filters by model
+and distance, and retains departure/finish timestamps, durations, overall speeds and estimate direction.
+Minute errors, daylight coverage and component details remain secondary diagnostics.
+
+Re-score saved Phase 4 predictions without fitting or changing deployed artifacts:
+
+```powershell
+uv run cycling planning percentages
+uv run cycling planning report
+```
+
+This updates the ignored `data/reports/journey-validation.json` and `.csv` with percentage statistics and
+per-ride errors. Existing earlier model selection is recorded with its original criterion; a lower final-set
+MAPE is descriptive and does not retune or switch the configured C+Weather default. A future explicitly
+requested `planning validate` selects stopping candidates by MAPE on **earlier selection folds only**,
+before independent final scoring. It does not use final-set rankings for selection. Private Phase 4.1
+delivery results are in `data/reports/phase4.1-report.md`.
