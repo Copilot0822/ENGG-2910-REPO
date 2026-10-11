@@ -124,6 +124,7 @@ class Store:
 
     def invalidate_model(self):
         self.set_state("model_stale", True)
+        self.set_state("journey_stale", True)
 
     def model_path(self):
         return self.root / "models" / "cycling.joblib"

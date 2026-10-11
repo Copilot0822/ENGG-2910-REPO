@@ -132,6 +132,9 @@ def _enrich_one(store, provider, ride, signature):
             ),
         },
     )
+    from .timing import timing_quality
+
+    store.update_metadata(ride_id, timing_quality(ride, points, encounters=encountered))
     store.invalidate_model()
     return ride_id, encountered, sorted(provider.warnings)
 

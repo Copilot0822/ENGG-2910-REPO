@@ -145,6 +145,8 @@ def parse_fit(data, max_points=1_000_000):
                     "recorded_avg_hr": fields.get("avg_heart_rate"),
                     "timer_s": fields.get("total_timer_time"),
                     "recorded_elapsed_s": fields.get("total_elapsed_time"),
+                    "recorded_start_utc": str(fields.get("start_time") or ""),
+                    "recorded_end_utc": str(fields.get("timestamp") or ""),
                 }
             )
         elif message.name == "event" and fields.get("event") == "timer" and fields.get("timestamp"):
@@ -171,6 +173,7 @@ def parse_fit(data, max_points=1_000_000):
                         stopped += (b - a).total_seconds()
             pauses.append(stopped)
         result["timer_pause_s"] = pauses
+    metadata["timer_event_count"] = len(timer_events)
     return result, metadata
 
 

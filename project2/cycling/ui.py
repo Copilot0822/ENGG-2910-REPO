@@ -1,8 +1,6 @@
 """Local Streamlit workflow and route visualization."""
 
-from datetime import datetime, time
 import json
-from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -13,8 +11,7 @@ import streamlit as st
 from .config import Settings
 from .importer import impute_ride_hr
 from .model import load_model
-from .pipeline import import_archive, prepare_route, process_history, route_for_model, train
-from .prediction import predict_route
+from .pipeline import import_archive, process_history, train
 from .storage import Store
 
 COLORS = {
@@ -104,6 +101,23 @@ def historical_page(store, settings):
     st.title("Historical data")
     st.write("Import your Strava export, inspect the recordings, then train a model of your riding.")
     rides = store.rides()
+    quality = store.get_state("timing_quality", {})
+    if quality:
+        st.caption(
+            f"Complete duration audit: {quality.get('reliable_elapsed', 0)}/{quality.get('rides', 0)} reliable · {quality.get('reliable_measured_hr', 0)} trustworthy measured-HR rides for suggestions."
+        )
+        with st.expander("Complete duration and HR quality"):
+            st.json(quality)
+    if st.button("Train elapsed-time planning and validate", disabled=len(rides) < 20):
+        from .journey import train_planning
+
+        try:
+            result = _run_progress(lambda p: train_planning(store, settings, p))
+            st.success(
+                f"Elapsed planning trained on {result['training']['stopping_rides']} reliable stopping histories. Open Model Performance for actual held-out errors."
+            )
+        except Exception as exc:
+            st.error(f"Elapsed/HR training failed: {exc}")
     if len(rides):
         hr, median = impute_ride_hr(rides)
         columns = st.columns(4)
@@ -481,152 +495,9 @@ def matching_inspector(points):
 
 
 def prediction_page(store, settings, model):
-    st.title("Route prediction")
-    if model is None:
-        st.info("Import your archive and train a model on the Historical Data page first.")
-        return
-    if store.get_state("model_stale", False):
-        st.warning(
-            "Historical data changed after training. Retrain for the latest rides and OSM annotations."
-        )
-    if (store.root / "models" / "model-C.joblib").exists():
-        import joblib
+    from .planning_ui import route_prediction_page
 
-        choices = [
-            v for v in ("CW", "C", "B", "A") if (store.root / "models" / f"model-{v}.joblib").exists()
-        ]
-        variant = st.selectbox(
-            "Prediction model",
-            choices,
-            format_func=lambda v: {
-                "A": "A · Geometry baseline",
-                "B": "B · Surface and road",
-                "C": "C · Surface and mapped traffic controls",
-                "CW": "C + Weather · Surface, mapped traffic and ECCC weather (default)",
-            }[v],
-        )
-        if variant != getattr(model, "variant", "C"):
-            model = joblib.load(store.root / "models" / f"model-{variant}.joblib")
-    if getattr(model, "variant", "C") not in ("C", "CW"):
-        st.info(
-            "This variant estimates rolling movement with geometry corners. Select model C for mapped traffic waits and the full-stop traffic-control scenario."
-        )
-    upload = st.file_uploader("Planned Komoot / GPX route", type=["gpx"])
-    with st.expander("Optional elevation correction"):
-        st.caption(
-            "Upload a trusted elevation profile with distance_m and elevation_m columns covering the whole route. Otherwise the GPX elevations are cleaned and used as supplied."
-        )
-        correction = st.file_uploader("Elevation profile CSV", type=["csv"])
-    left, right = st.columns(2)
-    default_hr = int(round(model.median_hr)) if model.median_hr else 140
-    target = left.number_input("Target average heart rate (BPM)", 35, 230, default_hr)
-    left.caption(
-        "Average over moving time, including braking and acceleration. Stationary waits and personal breaks are excluded."
-    )
-    if model.hr_available:
-        left.caption(
-            f"Measured HR support: {model.hr_range[0]:.0f}–{model.hr_range[1]:.0f} BPM. Terrain and learned drift shape the pacing profile."
-        )
-    else:
-        left.warning(
-            "Target HR cannot currently be modeled. The rider's learned terrain baseline will be used."
-        )
-    bikes = ["Any / unknown"] + model.support["bikes"]
-    bike = right.selectbox("Bike", bikes)
-    scenario = right.selectbox(
-        "Stop-sign scenario",
-        ["Full stops", "Observed historical behavior"]
-        if getattr(model, "variant", "C") in ("C", "CW")
-        else ["Rolling baseline; mapped traffic delays excluded"],
-    )
-    right.caption(
-        "Observed behavior describes past recordings. Full stops is the default for traffic-law-compliant planning."
-    )
-    breaks = right.number_input("Personal breaks (minutes)", 0.0, 1440.0, 0.0, step=5.0)
-    departure_date = left.date_input("Planned date", datetime.now(ZoneInfo("America/Toronto")).date())
-    departure_time = left.time_input("Departure time", time(9, 0))
-    timezone_name = left.text_input("Departure timezone", "America/Toronto")
-    forecast_enabled = left.checkbox(
-        "Use available ECCC hourly forecasts",
-        getattr(model, "variant", "C") == "CW",
-        disabled=getattr(model, "variant", "C") != "CW",
-    )
-    neutral = left.checkbox("Weather-neutral prediction", False)
-    left.caption(
-        "City Page hourly forecasts use the nearest available city within 50 km. They have a short horizon and are regional forecasts. Unavailable sections use the fitted weather-neutral model."
-    )
-    if st.button("Predict route", type="primary", disabled=upload is None):
-        try:
-            departure = (
-                datetime.combine(departure_date, departure_time)
-                .replace(tzinfo=ZoneInfo(timezone_name))
-                .isoformat()
-            )
-            data = upload.getvalue()
-            elevation_data = correction.getvalue() if correction else None
-            with st.spinner("Preparing route and looking up cached OSM roads…"):
-                st.session_state.route = prepare_route(
-                    data, upload.name, store, settings, elevation_data
-                )
-                route = st.session_state.route
-                route_segments, route_controls = route_for_model(route, model)
-                forecast = None
-                if forecast_enabled and not neutral:
-                    from .forecast import CityForecast
-
-                    forecast = CityForecast(store.root, settings)
-                    forecast.prepare(route_segments)
-                result = predict_route(
-                    model,
-                    route_segments,
-                    route_controls,
-                    target,
-                    None if bike == "Any / unknown" else bike,
-                    "full_stop" if scenario == "Full stops" else "observed",
-                    breaks,
-                    departure,
-                    model.validation.get("fitness_selected", False),
-                    weather_provider=forecast,
-                    weather_neutral=neutral,
-                )
-                if forecast is not None:
-                    comparison = predict_route(
-                        model,
-                        route_segments,
-                        route_controls,
-                        target,
-                        None if bike == "Any / unknown" else bike,
-                        "full_stop" if scenario == "Full stops" else "observed",
-                        breaks,
-                        departure,
-                        model.validation.get("fitness_selected", False),
-                        weather_neutral=True,
-                    )
-                    result["neutral_comparison"] = {
-                        k: comparison[k] for k in ("rolling_kmh", "moving_s", "elapsed_s")
-                    }
-                result["warnings"] += route["warnings"]
-                st.session_state.result = result
-            st.success("Prediction ready. Open Results in the sidebar.")
-            a, b, c = st.columns(3)
-            a.metric("Rolling speed", f"{result['rolling_kmh']:.1f} km/h")
-            b.metric("Moving time", duration(result["moving_s"]))
-            c.metric("Total elapsed", duration(result["elapsed_s"]))
-        except Exception as exc:
-            st.error(
-                f"Could not predict this route: {exc}. Check GPX geometry, elevation profile and timezone."
-            )
-    if "route" in st.session_state:
-        coverage = st.session_state.route.get("coverage")
-        if coverage:
-            st.caption(
-                f"Route OSM coverage: {coverage['matched_km'] / max(1e-9, coverage['total_km']):.1%} matched · {coverage['surfaces'].get('unknown', 0) / max(1e-9, coverage['total_km']):.1%} unknown surface."
-            )
-            st.dataframe(
-                pd.DataFrame([{"surface": k, "km": v} for k, v in coverage["surfaces"].items()]),
-                hide_index=True,
-                width="stretch",
-            )
+    route_prediction_page(store, settings, model)
 
 
 def route_map(result, route):
@@ -814,6 +685,11 @@ def results_page():
         st.info("Upload and predict a GPX on Route Prediction first.")
         return
     route = st.session_state.route
+    from .planning_ui import finish_results
+
+    settings = Settings.load()
+    finish_results(result, route, Store(settings.data_dir), settings)
+    st.subheader("Riding and route diagnostics")
     st.caption(
         f"{route['filename']} · {result['distance_m'] / 1000:.1f} km · model {result.get('model_variant', 'C')} · {result['model_kind']} · {result['scenario']} scenario"
     )
@@ -1027,7 +903,7 @@ def results_page():
     )
 
 
-def performance_page(store, model):
+def speed_performance_page(store, model):
     st.title("Model performance")
     if model is None:
         st.info("Train a model on Historical Data to inspect performance.")
@@ -1170,6 +1046,14 @@ def performance_page(store, model):
         "validation.json",
         "application/json",
     )
+
+
+def performance_page(store, model):
+    from .planning_ui import elapsed_performance
+
+    elapsed_performance(store)
+    with st.expander("Secondary riding-model and speed diagnostics"):
+        speed_performance_page(store, model)
 
 
 def main():

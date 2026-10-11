@@ -35,6 +35,11 @@ class Settings:
     weather_candidates: int = 4
     weather_min_interval_s: float = 1.0
     weather_max_requests: int = 700
+    hr_half_life_days: float = 180.0
+    hr_distance_bandwidth: float = 0.2
+    hr_min_comparable: int = 4
+    stopping_half_life_days: float = 180.0
+    daylight_safety_minutes: int = 30
     max_archive_bytes: int = 2_000_000_000
     max_uncompressed_bytes: int = 8_000_000_000
     max_entry_bytes: int = 128_000_000

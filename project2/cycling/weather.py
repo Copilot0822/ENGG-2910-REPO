@@ -357,8 +357,9 @@ def neutral_weather(frame):
 
 
 class HistoricalWeather:
-    def __init__(self, root, settings, client=None):
+    def __init__(self, root, settings, client=None, details=True):
         self.settings, self.client = settings, client or ECCCClient(root, settings)
+        self.details = details
         self.stations, self.months = [], {}
 
     def prepare(self, frame, refresh=False):
@@ -522,6 +523,8 @@ class HistoricalWeather:
         output["weather_interpolated"] = (np.column_stack(interpolated) & (measurement_weight > 0)).any(
             axis=1
         )
+        if not self.details:
+            return output
         for i in range(len(output)):
             used = np.flatnonzero(measurement_weight[i] > 0)
             output.at[i, "weather_station_ids"] = "|".join(selected_stations[j][0]["id"] for j in used)

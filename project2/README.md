@@ -1,7 +1,8 @@
-# Personalized cycling speed predictor
+# Personalized cycling ride-time and daylight planner
 
 A local Streamlit application that learns segment-level cycling performance from your own
-Strava recordings. Each project dependency and its Python environment lives inside `project2`.
+Strava recordings to estimate complete ride duration, finishing time and destination daylight.
+Each project dependency and its Python environment lives inside `project2`.
 Private recordings, caches and fitted models live in the ignored `data` directory.
 
 ## Windows quick start
@@ -27,16 +28,21 @@ downloaded automatically by uv when needed. No Docker, account credentials or AP
 1. **Historical Data:** upload the complete account ZIP, or enter its absolute disk path. No manual
    extraction is needed. Inspect the import report, then process and train. Incremental imports
    skip activities already identified by activity ID or original-recording SHA-256.
-2. **Route Prediction:** upload a GPX track or route exported from Komoot, enter a moving-time
-   average HR, select a bike, stop scenario, departure date/time/timezone, and personal breaks.
+2. **Route Prediction:** upload a GPX track or route exported from Komoot and choose a departure.
+   A measured-only, similar-distance HR suggestion fills the editable target field. Manual edits
+   survive reruns and new uploads; **Use suggested HR** explicitly restores the recommendation.
+   Select a bike, stop scenario, historical/custom/minimal personal stops and daylight margin.
    A GPX without usable elevation works, with an explicit terrain warning. A trusted optional CSV
    elevation profile can replace GPX elevations; use `distance_m,elevation_m` columns covering
    the whole route, including distance zero.
-3. **Results:** review cruising, rolling and overall speeds, the time ledger, route overlays,
+3. **Results:** review total duration, expected/median/conservative finish, sunset, civil twilight,
+   daylight margin and provisional elapsed intervals first. Riding speeds, the time ledger, route overlays,
    elevation, speed and progress charts, surface composition, pacing HR, and segment details.
-   Download private prediction data if desired. Personal breaks are a separate total; the progress
-   graph does not assign those breaks to arbitrary locations along the route.
-4. **Model Performance:** inspect chronological errors, baseline comparisons, recency candidates,
+   Download private prediction data if desired. Personal stops are distributed across broad progress
+   bands for timing, without predicting exact stopping locations. Latest departure recalculates candidate
+   departure times with changing weather/traffic rather than subtracting one fixed duration.
+4. **Model Performance:** complete elapsed error and automatic-HR accuracy are the headlines.
+   Inspect chronological errors, baseline comparisons, recency candidates,
    recent-fitness comparison, uncertainty coverage, data coverage, and errors by distance/surface/
    elevation. More features do not guarantee better accuracy; the dashboard explicitly reports
    when the segment model does not beat a simple baseline.
@@ -256,9 +262,10 @@ waits remain unknown, contribute zero *known* stationary delay, and produce a lo
 | Overall speed | Distance / (moving + known stationary waits + selected personal breaks) |
 
 Segment speeds are never averaged arithmetically. Waits and moving losses occupy separate ledgers.
-Personal breaks default to zero and are always visible. Unclassified historical coffee/photo/mechanical
-stops are not silently turned into predicted breaks. Sparse/auto-paused traces can prevent confident
-separation of stops and waiting; GPS alone cannot reconstruct what was not recorded.
+Personal stops default to learned historical behavior. Custom allowance replaces that component;
+minimal mode sets it to zero while retaining moving losses and traffic waits. The empirical/residual
+allowance can include unmapped traffic and riding-model bias; the application does not infer a stop's
+reason. Sparse traces can still have reliable total duration when independent activity timing agrees.
 
 ## Validation and confidence
 
@@ -294,11 +301,11 @@ Model C is the persistent default, with C+Weather preferred after weather-aware 
 mapped traffic penalties to labels already containing those effects; their elapsed totals are
 lower bounds. The same variant-specific feature/label construction is used for new GPX prediction.
 
-Elapsed accuracy requires reliable timestamps, sufficient matched coverage, no unlearned modeled
-waits, and at least 90% of recorded stationary time attributable to reliable traffic windows.
-Unclassified personal stops and recording gaps therefore often leave elapsed MAE unavailable.
-This is reported separately from rolling-speed accuracy. A diagnostic elapsed lower-bound error
-is retained, but is not presented as reliable traffic-delay accuracy.
+The preserved Phase 2/3 traffic-only validation required reliable mapped wait attribution and often
+could not score complete duration. Phase 4 instead audits Strava/FIT/GPS duration agreement independently
+of stop reasons, flags conflicting starts/spans, impossible durations, distance mismatches and long idle
+tails, and uses reliable total elapsed truth for the primary evaluation. The old speed/traffic report
+remains a secondary diagnostic.
 
 90% rolling-speed intervals use a finite-sample upper quantile of absolute speed errors from
 the later chronological calibration set, and transform endpoints into moving-time bounds.
@@ -350,7 +357,8 @@ accounting, caching and the Streamlit workflow. Tests mock OSM and ECCC response
   full stops may still be incidental pauses beside an intersection; recordings cannot prove why.
 * The basic median/gradient baseline comparison is reported; a boosted model that underperforms is
   flagged instead of advertised as an improvement. Feature-attribution/causal explanations, nested
-  hyperparameter searches, probabilistic HR dynamics and calibrated elapsed intervals are not included.
+  hyperparameter searches and probabilistic HR dynamics are not included. Empirical elapsed intervals
+  are evaluated prequentially and remain provisional when nominal coverage or support is insufficient.
 * Configured ZIP/point limits bound individual inputs; parsing a large allowed archive can still take
   substantial memory/time. PBF node-location indexing requires memory during the one-time index build. No background job queue
   or multi-user shared-data deployment is provided; run this as a single-user local app.
@@ -410,8 +418,9 @@ selecting nearby cities within 50 km. Each segment records the source city, dist
 valid time. This is a regional city forecast, **not a road-scale forecast or gridded product**.
 Conditions are reevaluated at predicted segment arrival times until timing stabilizes, and traffic
 context also advances along the journey. Outside the hourly horizon, predictions become weather-neutral.
-Precipitation probability is not treated as a rainfall amount. Unspecified personal-break locations
-are not inserted into segment arrival times. Forecast and neutral scenarios are available side by side.
+Precipitation probability is not treated as a rainfall amount. Expected personal stopping shifts
+downstream arrivals through broad progress allocations; exact locations remain unknown.
+Forecast and neutral scenarios are available side by side.
 
 [HRDPS](https://eccc-msc.github.io/open-data/msc-data/nwp_hrdps/readme_hrdps_en/) and GeoMet WCS were
 investigated. Automated gridded HRDPS retrieval/resampling remains an extension to the modular provider;
@@ -437,4 +446,58 @@ provisional; future forecast and elapsed-time intervals are not claimed calibrat
 
 Private Phase 3 reports and inspection artifacts live in `data/reports/`, including
 `phase3-report.md`, `weather-coverage.json`, `traffic-behavior.json`, and `model-comparison.json`.
-Phase 2 reports and models are preserved in `data/baseline_phase2/`. No new Python dependency is needed.
+Phase 2 reports and models are preserved in `data/baseline_phase2/`. Phase 3 required no new Python dependency.
+
+## Phase 4: complete duration, suggested effort and daylight
+
+Use the existing environment and caches:
+
+```powershell
+uv sync --locked
+uv run cycling planning audit
+uv run cycling planning validate --validation-rides 48
+uv run cycling predict "planned-route.gpx" --departure "2026-10-12T09:00:00-04:00" --forecast
+uv run cycling predict "planned-route.gpx" --hr 145 --break-mode custom --break-minutes 20 --departure "2026-10-12T09:00:00-04:00"
+uv run streamlit run app.py
+```
+
+An optional `planning audit --archive <original-export.zip>` recovers missing FIT timing metadata
+without replacing points, OSM annotations or weather caches. Future imports retain this metadata.
+`planning train` fits the planning layer using the saved validation choices; `planning validate`
+performs fresh chronological evaluation and fits it. C+Weather remains the default riding model.
+
+HR uses only reliable original moving-time-weighted samples (at least 70% coverage), or an explicitly
+identified recorded summary when samples are unavailable. Distance similarity is smooth in log distance,
+initially near ±20%, broadens when support is sparse and combines a weighted median with recency.
+Terrain/bike are weak modifiers only with adequate evidence. General baseline and unsupported extrapolation
+are labeled. HR recency is selected separately from speed recency on earlier measured-HR activities.
+Configuration: `hr_half_life_days`, `hr_distance_bandwidth`, `hr_min_comparable`,
+`stopping_half_life_days`, `daylight_safety_minutes` in the ignored local config.
+
+Stopping candidates compare distance/context distributions of residual stationary time with a duration
+residual trained from earlier out-of-sample moving-plus-traffic predictions. Method selection precedes final
+evaluation. Unknown stop reasons are allowed, not fabricated. Residual allowance can absorb riding-model
+bias, so its personal/traffic interpretation is uncertain. Traffic and personal ledgers are kept exclusive.
+Custom/minimal modes share the same riding and traffic models; changed arrivals can change weather/waits.
+
+The complete elapsed backtest uses automatic HR from each earlier prefix, with a separate known measured-HR
+evaluation. External historical weather is queried at **predicted** segment arrivals, never held-out passage
+timestamps. This remains retrospective weather evaluation, not issued-forecast skill. All final variants
+share routes/departures and reliable-duration exclusions. Results include signed/absolute elapsed errors,
+overall speed, 80/90% interval coverage, daylight classifications, distance groups and a sortable per-ride table.
+
+Elapsed intervals use asymmetric empirical out-of-sample duration-scaled errors. Historical coverage must
+meet nominal targets, adequate comparable support must exist, and forecast/scenario changes must be accounted
+for before confidence is presented as supported. Before-cutoff percentages are withheld with sparse or
+unsupported probability calibration. Long-distance counts are shown; a conservative estimate is no guarantee.
+
+New dependencies are [Astral](https://astral.readthedocs.io/en/latest/) and
+[timezonefinder](https://timezonefinder.readthedocs.io/en/latest/): all sun/timezone calculations are local.
+Destination coordinates and its IANA timezone determine sunset and civil twilight. UTC duration arithmetic
+handles DST and crossing timezone boundaries; ambiguous/nonexistent departure wall times require an explicit
+occurrence or correction. Overnight plans retain the departure day's daylight cutoff; polar cases have no
+invented sunset. Default cutoff is sunset minus 30 minutes. Civil twilight is reduced light.
+
+Private results are written to `data/reports/journey-validation.json`, `journey-validation.csv`,
+`timing-quality.json`, and `phase4-report.md`. `data/models/journey.joblib` contains the fitted stopping and
+elapsed-calibration layer. Prior Phase 3 reports are preserved in `data/baseline_phase3/`.

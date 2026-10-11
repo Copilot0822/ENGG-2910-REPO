@@ -8,7 +8,6 @@ from pathlib import Path
 from .config import Settings
 from .model import load_model
 from .pipeline import import_archive, prepare_route, process_history, route_for_model, train
-from .prediction import predict_route
 from .storage import Store
 
 
@@ -37,7 +36,16 @@ def main():
         help="Retained variant; default is traffic-aware C + Weather when trained",
     )
     predictor.add_argument("--scenario", choices=["full_stop", "observed"], default="full_stop")
-    predictor.add_argument("--break-minutes", type=float, default=0)
+    predictor.add_argument("--break-minutes", type=float)
+    predictor.add_argument("--break-mode", choices=["historical", "custom", "minimal"])
+    predictor.add_argument(
+        "--daylight-reference", choices=["sunset", "civil_twilight"], default="sunset"
+    )
+    predictor.add_argument("--safety-minutes", type=float, default=30)
+    predictor.add_argument("--latest-departure", action="store_true")
+    predictor.add_argument(
+        "--latest-criterion", choices=["conservative", "median", "expected"], default="conservative"
+    )
     predictor.add_argument("--output", help="Write private segment predictions to CSV")
     predictor.add_argument("--departure", help="Planned ISO timestamp with timezone")
     predictor.add_argument(
@@ -62,6 +70,12 @@ def main():
         "compare", help="Paired chronological comparisons; retain the traffic-aware C default"
     )
     compare.add_argument("--validation-rides", type=int)
+    planning = sub.add_parser(
+        "planning", help="Audit and train measured-HR, total duration and daylight planning"
+    )
+    planning.add_argument("action", choices=["audit", "train", "validate", "report"])
+    planning.add_argument("--archive", help="Optional original export for missing FIT timing metadata")
+    planning.add_argument("--validation-rides", type=int)
     args = parser.parse_args()
     settings = Settings.load()
     if args.data_dir:
@@ -149,6 +163,26 @@ def main():
                 for k, v in summary.items()
                 if k not in ("rows", "paired_rows", "selection_rows", "candidates", "groups")
             }
+        elif args.command == "planning":
+            from .timing import audit_history
+            from .journey import train_planning
+
+            if args.validation_rides:
+                settings.validation_rides = args.validation_rides
+            if args.action == "audit":
+                summary = audit_history(store, settings, args.archive, progress)
+            elif args.action in ("train", "validate"):
+                summary = train_planning(
+                    store, settings, progress, args.action == "validate", args.archive
+                )
+            else:
+                report = store.get_state("journey_validation", {})
+                summary = {
+                    "training": store.get_state("journey_training"),
+                    "timing": store.get_state("timing_quality"),
+                    "comparisons": report.get("comparisons"),
+                    "hr_metrics": report.get("hr_metrics"),
+                }
         elif args.command == "train":
             settings.optimize_half_life = args.optimize_half_life or settings.optimize_half_life
             if args.validation_rides:
@@ -187,19 +221,37 @@ def main():
 
                 forecast = CityForecast(store.root, settings)
                 forecast.prepare(route_segments)
-            result = predict_route(
-                model,
-                route_segments,
-                route_controls,
-                args.hr,
-                args.bike,
-                args.scenario,
-                args.break_minutes,
-                departure=args.departure,
-                use_fitness=model.validation.get("fitness_selected", False),
-                weather_provider=forecast,
-                weather_neutral=args.weather_neutral,
-            )
+            from .journey import plan_ride, load_planning
+
+            planning = load_planning(store)
+
+            def candidate(departure):
+                return plan_ride(
+                    model,
+                    route,
+                    store.rides(),
+                    settings,
+                    planning,
+                    args.hr,
+                    args.bike,
+                    departure,
+                    args.scenario,
+                    args.break_mode or ("custom" if args.break_minutes is not None else "historical"),
+                    args.break_minutes or 0,
+                    forecast,
+                    args.weather_neutral,
+                    args.daylight_reference,
+                    args.safety_minutes,
+                    manual_hr=args.hr is not None,
+                )
+
+            result = candidate(args.departure)
+            if args.latest_departure and result["daylight"]["cutoff"]:
+                from .daylight import latest_departure
+
+                result["latest_departure"] = latest_departure(
+                    candidate, result["daylight"]["cutoff"], criterion=args.latest_criterion
+                )
             summary = {k: v for k, v in result.items() if k not in ("segments", "surfaces", "events")}
             summary["warnings"] += route["warnings"]
             if args.output:

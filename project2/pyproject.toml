@@ -5,6 +5,7 @@ description = "Local, personalized segment-level cycling speed and journey-time 
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
+  "astral>=3.2,<4",
   "defusedxml>=0.7.1",
   "fitparse>=1.2.0",
   "gpxpy>=1.6.2",
@@ -20,6 +21,7 @@ dependencies = [
   "scipy>=1.14",
   "shapely>=2.0",
   "streamlit>=1.42",
+  "timezonefinder>=7,<9",
 ]
 
 [project.optional-dependencies]

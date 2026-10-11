@@ -245,6 +245,9 @@ def import_archive(source, store, settings, progress=None):
                 meta["timestamp_reliable"] = diagnostics["unobserved_s"] <= max(
                     30, diagnostics["elapsed_s"] * 0.03
                 )
+                from .timing import timing_quality
+
+                meta.update(timing_quality(meta, points, recorded))
                 reasons = []
                 if diagnostics["unobserved_s"] > 30:
                     reasons.append("Sparse/paused intervals; some stopped time cannot be identified")

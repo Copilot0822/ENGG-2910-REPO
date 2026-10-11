@@ -13,11 +13,16 @@ def speed_from_time(distance_m, time_s):
     return float(distance_m / time_s * 3.6) if time_s > 0 else 0.0
 
 
-def _allocate_events(frame, events, model, cruise, scenario, departure, moving, previous_waits):
+def _allocate_events(
+    frame, events, model, cruise, scenario, departure, moving, previous_waits, previous_breaks=None
+):
     losses = np.zeros(len(frame))
     waits = np.zeros(len(frame))
     details = []
-    arrivals = np.cumsum(moving + previous_waits) - moving - previous_waits
+    previous_breaks = np.zeros(len(frame)) if previous_breaks is None else previous_breaks
+    arrivals = (
+        np.cumsum(moving + previous_waits + previous_breaks) - moving - previous_waits - previous_breaks
+    )
     for event in events:
         ix = int(np.argmin(abs(frame.end_m.to_numpy() - event["distance_m"])))
         fraction = float(
@@ -48,6 +53,8 @@ def predict_route(
     use_fitness=False,
     weather_provider=None,
     weather_neutral=False,
+    stopping_model=None,
+    break_mode="custom",
 ):
     if len(segments) == 0:
         raise ValueError("The route contains no usable segments.")
@@ -55,6 +62,8 @@ def predict_route(
         raise ValueError("Choose full_stop or observed historical behavior.")
     if personal_break_minutes < 0:
         raise ValueError("Personal break time cannot be negative.")
+    if break_mode not in ("historical", "custom", "minimal"):
+        raise ValueError("Choose historical, custom or minimal breaks.")
     if target_hr is not None and not 35 <= target_hr <= 230:
         raise ValueError("Target average HR must be between 35 and 230 BPM.")
     from .comparison import prediction_inputs
@@ -126,13 +135,27 @@ def predict_route(
     cruise = model.predict_cruise(frame)
     moving = ds / (cruise / 3.6)
     waits = np.zeros(len(frame))
+    from .stopping import allocate_breaks
+
+    break_estimate = None
+
+    def expected_breaks(duration):
+        nonlocal break_estimate
+        if break_mode == "historical" and stopping_model is not None:
+            break_estimate = stopping_model.predict(frame, float(duration.sum()), event_moment, bike)
+            return allocate_breaks(
+                frame, break_estimate["expected_s"], break_estimate["progress_weights"]
+            )
+        return allocate_breaks(frame, personal_break_minutes * 60 if break_mode == "custom" else 0)
+
+    break_delays = expected_breaks(moving)
     event_losses, waits, details = _allocate_events(
-        frame, events, model, cruise, scenario, event_moment, moving, waits
+        frame, events, model, cruise, scenario, event_moment, moving, waits, break_delays
     )
     converged = False
     for iteration in range(20):
         frame["moving_hours"] = (np.cumsum(moving) - moving / 2) / 3600
-        arrival_s = np.cumsum(moving + waits) - moving - waits + moving / 2
+        arrival_s = np.cumsum(moving + waits + break_delays) - moving - waits - break_delays + moving / 2
         frame["arrival_time_utc"] = event_moment + pd.to_timedelta(arrival_s, unit="s")
         if weather_provider is not None and not weather_neutral:
             frame = weather_provider.at(frame, frame.arrival_time_utc)
@@ -149,10 +172,15 @@ def predict_route(
             hr_values = profile(brentq(constraint, -100, 100, xtol=0.01))
         cruise = model.predict_cruise(frame, hr_values if target_hr is not None else None, use_fitness)
         event_losses, waits, details = _allocate_events(
-            frame, events, model, cruise, scenario, event_moment, moving, waits
+            frame, events, model, cruise, scenario, event_moment, moving, waits, break_delays
         )
         updated = ds / (cruise / 3.6) + event_losses
-        if np.max(abs(updated - moving) / np.maximum(1, moving)) < 0.002:
+        updated_breaks = expected_breaks(updated)
+        breaks_converged = abs(updated_breaks.sum() - break_delays.sum()) < max(
+            1, break_delays.sum() * 0.002
+        )
+        break_delays = updated_breaks
+        if np.max(abs(updated - moving) / np.maximum(1, moving)) < 0.002 and breaks_converged:
             moving = updated
             converged = True
             break
@@ -170,13 +198,15 @@ def predict_route(
     frame["stationary_delay_s"] = waits
     frame["rolling_kmh"] = ds / moving * 3.6
     frame["predicted_hr"] = hr_values
-    frame["elapsed_time_s"] = moving + waits
+    frame["discretionary_delay_s"] = break_delays
+    frame["elapsed_time_s"] = moving + waits + break_delays
     frame["accumulated_moving_s"] = np.cumsum(moving)
-    frame["accumulated_elapsed_s"] = np.cumsum(moving + waits)
+    frame["accumulated_elapsed_s"] = np.cumsum(moving + waits + break_delays)
+    frame["segment_end_time_utc"] = event_moment + pd.to_timedelta(frame.accumulated_elapsed_s, unit="s")
     cruising_time = float((ds / (cruise / 3.6)).sum())
     moving_time = float(moving.sum())
     stationary_time = float(waits.sum())
-    breaks = personal_break_minutes * 60
+    breaks = float(break_delays.sum())
     total_time = moving_time + stationary_time + breaks
     uncovered = [e for e in details if not e["stationary_known"]]
     weather_coverage = float(
@@ -193,10 +223,20 @@ def predict_route(
     if weather_provider is not None:
         warnings.append(getattr(weather_provider, "note", "ECCC external weather observations"))
         warnings.extend(sorted(set(weather_provider.client.errors)))
-        if breaks:
-            warnings.append(
-                "Personal breaks are added to the total ledger. Their locations are unspecified, so they do not shift segment weather arrival times."
-            )
+    if breaks:
+        warnings.append(
+            "Expected personal stopping is distributed broadly through route progress and shifts downstream weather/traffic arrival times; precise stopping locations are not predicted."
+        )
+    if break_mode == "historical":
+        warnings.extend(
+            break_estimate["warnings"]
+            if break_estimate
+            else ["No fitted stopping history; usual personal delays are unknown."]
+        )
+    elif break_mode == "minimal":
+        warnings.append(
+            "Minimal personal breaks is an optimistic scenario; traffic delays and moving slowdowns are retained."
+        )
     if uncovered:
         warnings.append(
             f"{len(uncovered)} traffic events lack calibrated stationary waits. Elapsed time excludes unknown waits; it may be understated. Full-stop fallback reaches zero speed without inventing dwell time."
@@ -247,7 +287,12 @@ def predict_route(
         "moving_s": moving_time,
         "stationary_s": stationary_time,
         "personal_break_s": breaks,
+        "moving_slowdown_s": float(event_losses.sum()),
+        "break_mode": break_mode,
+        "break_estimate": break_estimate,
         "elapsed_s": total_time,
+        "departure_utc": event_moment.isoformat(),
+        "finish_time_utc": (event_moment + pd.Timedelta(seconds=total_time)).isoformat(),
         "requested_hr": requested,
         "modeled_target_hr": target_hr,
         "achieved_hr": achieved_hr,
