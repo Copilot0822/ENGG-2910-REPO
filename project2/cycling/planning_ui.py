@@ -16,6 +16,7 @@ from .journey import load_planning, plan_ride
 from .pipeline import prepare_route, route_for_model
 from .stopping import route_features
 from .phase5_ui import phase5_performance
+from .elapsed_models import LABELS
 
 
 def duration(seconds):
@@ -200,10 +201,10 @@ def route_prediction_page(store, settings, model):
             ),
             key="journey_method",
             format_func=lambda value: {
-                "automatic": "Automatic · use supported default",
+                "automatic": "Automatic · use operational default",
                 "CW+stops-auto": "Existing residual stopping model",
                 "CW-auto": "C + Weather · no discretionary allowance",
-                "two-stage": "Two-stage stopping candidate",
+                "two-stage": "Two-stage personalized stopping",
                 "bias-corrected": "Bias-corrected elapsed candidate",
                 "hybrid": "Hybrid elapsed candidate",
                 "hybrid-stops": "Hybrid with two-stage stopping candidate",
@@ -215,6 +216,26 @@ def route_prediction_page(store, settings, model):
                 "Existing personalized stopping default. New methods become available after chronological validation.",
             )
         )
+        selected_method = st.session_state.get("journey_method", "automatic")
+        displayed_method = (
+            planning.get("operational_default", planning.get("recommended_method", "CW+stops-auto"))
+            if selected_method == "automatic"
+            else selected_method
+        )
+        if getattr(model, "variant", "C") != "CW" or break_mode != "historical":
+            displayed_method = "physical"
+        st.markdown(
+            f"**Total-duration model: {LABELS.get(displayed_method, displayed_method or 'Unavailable')}**"
+        )
+        st.markdown(
+            f"**Riding model: { {'CW': 'C+Weather', 'C': 'Model C', 'B': 'Model B', 'A': 'Model A'}.get(getattr(model, 'variant', 'C'), 'Model C') }**"
+        )
+        if selected_method == "automatic" and displayed_method == "two-stage":
+            st.caption(
+                "Automatic uses the improved personalized stop allowance and its own conservative calibration. Stop reasons remain unattributed and confidence is provisional."
+            )
+        if planning.get("operational_blocker"):
+            st.warning(planning["operational_blocker"])
         st.caption(
             "Observed behavior matches historical elapsed validation. Full stops, manual HR, custom/minimal breaks and future forecasts are planning scenarios with provisional confidence."
         )
@@ -247,7 +268,17 @@ def route_prediction_page(store, settings, model):
         st.caption(
             "Short-horizon regional City Page forecasts supply wind and temperature. Missing sections use the fitted terrain baseline. Predicted personal stops shift downstream arrivals."
         )
-    if st.button("Predict total ride time", type="primary", disabled=route is None or not zone_valid):
+    auto_blocked = bool(
+        planning.get("operational_blocker")
+        and st.session_state.get("journey_method", "automatic") == "automatic"
+        and break_mode == "historical"
+        and getattr(model, "variant", "C") == "CW"
+    )
+    if st.button(
+        "Predict total ride time",
+        type="primary",
+        disabled=route is None or not zone_valid or auto_blocked,
+    ):
         try:
             departure = local_departure(
                 day,
@@ -354,7 +385,7 @@ def finish_results(result, route, store, settings):
         else "Unknown",
     )
     st.caption(
-        f"Total-duration method: {result.get('journey_method', 'existing stopping')} · {result.get('journey_choice_reason', '')}"
+        f"Total-duration model: {LABELS.get(result.get('journey_method'), result.get('journey_method', 'existing stopping'))} · riding model: {'C+Weather' if result.get('model_variant') == 'CW' else result.get('model_variant', 'C')} · {result.get('journey_choice_reason', '')}"
     )
     phase5 = store.get_state("phase5_validation", {})
     if phase5:

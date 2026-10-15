@@ -11,11 +11,12 @@ from .model import recency_weight
 
 
 LABELS = {
+    "physical": "Riding and traffic with the selected break allowance",
     "C-auto": "Model C",
     "CW-auto": "C + Weather, no breaks",
     "CW+stops-auto": "Existing residual stops",
     "simple-elapsed": "Historical elapsed baseline",
-    "two-stage": "Two-stage unattributed stopping",
+    "two-stage": "Two-stage personalized stopping",
     "bias-corrected": "Bias-corrected C + Weather",
     "hybrid": "Hybrid elapsed duration",
     "hybrid-stops": "Hybrid with two-stage stopping",

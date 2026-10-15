@@ -598,3 +598,41 @@ uv run ruff format --check cycling tests app.py
 Private detailed results are in `data/reports/phase5-report.md`, `phase5-validation.json/.csv`,
 `phase5-initial-diagnostics.md`, and `phase5-initial-ledger.csv`. Original models/reports are
 copied to `data/baseline_phase5/` with hashes. All recordings, caches and artifacts remain ignored.
+
+## Phase 5.1: corrected Automatic default
+
+Automatic now uses **Two-stage personalized stopping** over the unchanged **C+Weather** riding
+model, with the two-stage model's own asymmetric elapsed calibration. This is an explicit
+operational correction informed by already inspected historical results. The original
+hybrid-stops gate against CW-auto failed and remains recorded; that comparator failure no longer
+implicitly chooses the different legacy CW+stops-auto incumbent. Bias correction and both hybrids
+remain selectable advanced alternatives with unchanged parameters.
+
+Existing Phase 5 installations migrate when planning is loaded, or can refresh explicitly:
+
+```powershell
+uv run cycling planning refresh-default
+uv run cycling planning report
+uv run streamlit run app.py
+```
+
+The refresh verifies saved stopping history, frozen parameters, model-specific calibration and
+historical paired evidence. It writes a separate `data/models/journey-phase5.1.joblib` and
+`data/reports/phase5.1-release.json`, plus `phase5_1_release` metadata. It does not fit models or
+replace the original Phase 4/4.1 or Phase 5 artifacts/reports. Dependency signatures detect changed
+riding models, history, calibration and inconsistent default metadata. Invalid evidence blocks
+Automatic with an explanation; a refresh cannot validate a changed riding model against old errors.
+Manual duration-model and HR preferences remain in Streamlit session state.
+
+Route Prediction and Results show the actual duration and riding models. Model Performance pins
+the current default's reused/fresh metrics separately from the selected historical diagnostic.
+Two-stage's 17.00% reused and 21.48% fresh MAPE describe already inspected rides. All 63 fresh
+rides were below 100 km; the longest reused bands contain only one ride each. Lower MAPE does
+not imply safer daylight decisions: underprediction is more frequent than with legacy stopping,
+interval coverage is below nominal and before-dark probabilities remain withheld. Conservative
+finish estimates remain provisional, with the existing sunset margin and long-distance warnings.
+Custom/minimal breaks bypass historical discretionary stopping and total-duration corrections.
+
+The private implementation, migration, paired metrics and complete verification report is
+`data/reports/phase5.1-default-fix.md`. Cached-route and real-widget checks are functional checks,
+not new accuracy evidence.

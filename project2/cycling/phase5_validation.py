@@ -23,6 +23,7 @@ from .tail_calibration import TailCalibration
 from .two_stage import HurdleStopping
 from .validation import held_out_route
 from .weather import HistoricalWeather
+from .release_policy import reference_gate
 
 
 STOP_GRID = {
@@ -533,18 +534,20 @@ def evaluate_phase5(store, settings, progress=None):
     reused = [r for r in calibrated if r["id"] in benchmark_ids]
     fresh = [r for r in calibrated if r["id"] not in benchmark_ids]
     fresh_delta = paired_difference(fresh, "automatic")
-    supported = (
-        winner != "CW-auto"
-        and fresh_delta.get("mape_difference_pp", 0) < -1
-        and fresh_delta.get("bootstrap_95_pp", [0, 1])[1] < 0
-    )
+    incumbent = store.get_state("phase5_1_release", {}).get(
+        "new_operational_default"
+    ) or store.get_state("phase5_training", {}).get("recommended_method", "CW+stops-auto")
+    gate = reference_gate(winner, fresh_delta, incumbent)
     report = {
         "status": "complete",
         "protocol": protocol,
         "frozen_selection": frozen,
         "selected_method": winner,
-        "recommended_method": winner if supported else "CW+stops-auto",
-        "default_changed": bool(supported),
+        "recommended_method": incumbent,
+        "default_changed": False,
+        "reference_gate": gate,
+        "benchmark_ids": sorted(benchmark_ids),
+        "operational_selection": "Evaluation records comparator evidence; planning artifact verification separately selects the operational default.",
         "fresh_difference": fresh_delta,
         "reused_difference": paired_difference(reused, "automatic"),
         "nested_selection": summary(nested),

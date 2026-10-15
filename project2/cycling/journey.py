@@ -13,12 +13,13 @@ from .stopping import StoppingModel, route_features
 from .elapsed_models import DurationCorrection, apply_duration_correction, historical_baseline
 from .tail_calibration import TailCalibration
 from .two_stage import HurdleStopping
+from .release_policy import load_operational_planning, archive_artifact
 
 
 def load_planning(store):
     phase5 = store.root / "models/journey-phase5.joblib"
-    if phase5.exists() and not store.get_state("phase5_stale", False):
-        return joblib.load(phase5)
+    if phase5.exists():
+        return load_operational_planning(store)
     path = store.root / "models/journey.joblib"
     return joblib.load(path) if path.exists() else {"stopping": None, "calibrations": {}}
 
@@ -65,26 +66,46 @@ def plan_ride(
     if target_hr is None and not manual_hr:
         target_hr = recommendation["suggested_hr"]
     chosen = (
-        planning.get("recommended_method", "CW+stops-auto")
+        planning.get("operational_default", planning.get("recommended_method", "CW+stops-auto"))
         if journey_method == "automatic"
         else journey_method
     )
     reason = planning.get("selection_reason", "Existing personalized stopping model.")
-    if chosen in ("two-stage", "bias-corrected", "hybrid", "hybrid-stops") and not planning.get(
-        "phase5"
-    ):
-        chosen = "CW+stops-auto"
-        reason = "No validated Phase 5 planning artifact; existing stopping fallback."
-    elif journey_method != "automatic":
+    if journey_method != "automatic":
         reason = f"User selected {chosen}. Compare its own chronological diagnostics; it may differ from the supported automatic default."
     if getattr(model, "variant", "C") != "CW" or break_mode != "historical":
         chosen = "physical"
         reason = "Physical riding model with the selected break allowance; historical total-duration corrections are disabled for custom/minimal breaks and other riding models."
     stopping = planning.get("stopping")
+    if chosen is None:
+        raise ValueError(
+            planning.get("operational_blocker", "Automatic has no verified operational default.")
+        )
+    if chosen in ("two-stage", "bias-corrected", "hybrid", "hybrid-stops") and not planning.get(
+        "phase5"
+    ):
+        raise ValueError("This method requires a saved Phase 5 planning artifact.")
     if chosen == "two-stage":
-        stopping = planning.get("hurdle", stopping)
+        stopping = planning.get("hurdle")
+        if not isinstance(stopping, HurdleStopping):
+            raise ValueError(
+                "Two-stage stopping is unavailable; legacy stopping cannot substitute under its label."
+            )
     elif chosen == "hybrid-stops":
-        stopping = planning.get("hybrid_hurdle", stopping)
+        stopping = planning.get("hybrid_hurdle")
+        if not isinstance(stopping, HurdleStopping):
+            raise ValueError("The saved hybrid stopping component is unavailable.")
+    elif (
+        chosen == "physical"
+        and break_mode == "historical"
+        and planning.get("operational_default") == "two-stage"
+    ):
+        stopping = planning.get("hurdle")
+    correction = planning.get("corrections", {}).get(chosen)
+    if chosen in ("bias-corrected", "hybrid", "hybrid-stops") and correction is None:
+        raise ValueError(
+            "The saved correction for the selected method is unavailable; no differently labelled fallback was applied."
+        )
     physical_mode = "minimal" if chosen in ("CW-auto", "bias-corrected", "hybrid") else break_mode
     result = predict_route(
         model,
@@ -103,7 +124,6 @@ def plan_ride(
     )
     result["physical_elapsed_s"] = result["elapsed_s"]
     result["statistical_correction_s"] = 0.0
-    correction = planning.get("corrections", {}).get(chosen)
     if correction is not None:
         features = route_features(segments, bike)
         baseline = historical_baseline(rides, features["distance_km"], departure)
@@ -111,12 +131,19 @@ def plan_ride(
             result["elapsed_s"], baseline, features["distance_km"], departure, features
         )
         result = apply_duration_correction(result, total, detail)
-    elif chosen in ("bias-corrected", "hybrid", "hybrid-stops"):
-        chosen = "CW+stops-auto"
-        reason = "No saved chronological correction model; existing stopping fallback."
     result["journey_method"] = chosen
     result["journey_method_requested"] = journey_method
     result["journey_choice_reason"] = reason
+    result["operational_default"] = planning.get(
+        "operational_default", planning.get("recommended_method")
+    )
+    result["stopping_method"] = (
+        "two-stage"
+        if physical_mode == "historical" and isinstance(stopping, HurdleStopping)
+        else "legacy residual stops"
+        if physical_mode == "historical" and stopping is not None
+        else physical_mode
+    )
     result["break_mode"] = break_mode
     result["hr_recommendation"] = recommendation
     result["hr_selection"] = "manual override" if manual_hr else "automatic suggestion"
@@ -129,6 +156,10 @@ def plan_ride(
     if getattr(model, "variant", "CW") != "CW":
         key = getattr(model, "variant", "C") + ("-auto" if break_mode == "minimal" else "+stops-auto")
     calibration = planning.get("calibrations", {}).get(key, TailCalibration())
+    if chosen == "two-stage" and key not in planning.get("calibrations", {}):
+        raise ValueError(
+            "Two-stage elapsed calibration is unavailable; the old model's intervals cannot substitute."
+        )
     uncertainty = calibration.estimate(
         result["elapsed_s"],
         result["distance_m"] / 1000,
@@ -137,6 +168,10 @@ def plan_ride(
         break_mode=break_mode,
     )
     uncertainty["calibration_key"] = key
+    if planning.get("operational_blocker"):
+        uncertainty["provisional"] = True
+        uncertainty["probability_supported"] = False
+        uncertainty["warnings"].append(planning["operational_blocker"])
     uncertainty["calibration_scenario"] = (
         "Observed traffic, automatic suggested HR, historical breaks and observed weather"
     )
@@ -243,17 +278,16 @@ def fit_phase5(store, settings, report=None):
         )
         for key, rows in report["calibration_rows"].items()
     }
-    planning["recommended_method"] = report["recommended_method"]
+    planning["recommended_method"] = report.get("recommended_method")
     planning["selection_reason"] = (
         f"Earlier chronological selection chose {report['selected_method']}. "
         + (
-            "Fresh later paired validation passed the predeclared default-change gate."
-            if report["default_changed"]
-            else "Fresh later evidence did not pass the predeclared default-change gate; the existing default is retained."
+            "Reference-gate result is recorded separately; the operational default requires artifact and calibration verification."
         )
     )
     planning["phase5"] = True
     planning["trained_at"] = pd.Timestamp.now(tz="UTC").isoformat()
+    archive_artifact(store.root / "models/journey-phase5.joblib")
     joblib.dump(planning, store.root / "models/journey-phase5.joblib", compress=3)
     store.set_state("phase5_stale", False)
     store.set_state(
@@ -267,7 +301,7 @@ def fit_phase5(store, settings, report=None):
     (store.root / "reports/phase5-training.json").write_text(
         json.dumps(store.get_state("phase5_training"), indent=2), encoding="utf-8"
     )
-    return planning
+    return load_operational_planning(store)
 
 
 def fit_planning(store, settings, validation=None):

@@ -8,7 +8,51 @@ from .elapsed_models import LABELS
 
 
 def phase5_performance(report, store):
+    from .journey import load_planning
+    from .phase5_validation import paired_difference
+
     st.title("Total ride-time accuracy")
+    planning = load_planning(store)
+    release = planning.get("release_decision", {})
+    recommended = planning.get("operational_default", planning.get("recommended_method"))
+    st.markdown(
+        f"**Current operational default: {LABELS.get(recommended, recommended or 'Unavailable')}**"
+    )
+    st.caption(
+        "Riding model: C+Weather. The operational correction uses already inspected evidence; it is not a newly preregistered or independent confirmation."
+    )
+    if planning.get("operational_blocker"):
+        st.error(planning["operational_blocker"])
+    if recommended:
+        operational = []
+        for label, key in [
+            ("Reused benchmark (already inspected)", "reused"),
+            ("Fresh complementary cohort (already inspected)", "fresh"),
+        ]:
+            metric = next((m for m in report[key]["comparisons"] if m["variant"] == recommended), None)
+            if metric:
+                operational.append(
+                    {"Cohort": label, "Method": LABELS.get(recommended, recommended), **metric}
+                )
+        st.dataframe(
+            pd.DataFrame(operational).reindex(
+                columns=[
+                    "Cohort",
+                    "Method",
+                    "rides",
+                    "elapsed_mape",
+                    "elapsed_mdape",
+                    "elapsed_mspe",
+                    "elapsed_p90_ape",
+                    "underprediction_percentage",
+                    "coverage_80",
+                    "coverage_90",
+                    "conservative_optimistic_errors",
+                ]
+            ),
+            hide_index=True,
+            width="stretch",
+        )
     cohort = st.selectbox(
         "Evaluation cohort", ["Fresh later comparisons", "Reused 32-ride benchmark", "All later rides"]
     )
@@ -19,7 +63,6 @@ def phase5_performance(report, store):
     }[cohort]
     comparison = pd.DataFrame(report[key]["comparisons"])
     variants = comparison.variant.tolist()
-    recommended = report["recommended_method"]
     diagnostic = st.selectbox(
         "Elapsed diagnostic model",
         variants,
@@ -27,6 +70,7 @@ def phase5_performance(report, store):
         format_func=lambda value: LABELS.get(value, value),
     )
     metric = comparison[comparison.variant.eq(diagnostic)].iloc[0]
+    st.caption(f"Selected historical diagnostic: {LABELS.get(diagnostic, diagnostic)} · {cohort}.")
     st.metric("Average absolute total-time error", f"{metric.elapsed_mape:.1f}%")
     a, b, c = st.columns(3)
     a.metric("Median APE", f"{metric.elapsed_mdape:.1f}%")
@@ -43,10 +87,10 @@ def phase5_performance(report, store):
         "Historical per-ride percentages of actual complete elapsed duration; MAPE and P90 error are aggregate diagnostics, not route-specific uncertainty bounds. Negative bias means optimistic shorter rides."
     )
     st.warning(
-        "The original 32 rides were inspected in previous phases and are a reused benchmark. Fresh later comparison rides were absent from that benchmark, but are mostly short. Expanding-window nested selection also assesses the policy; speed-model choices were inherited from earlier phases. Long-distance and issued-forecast reliability remain provisional."
+        "The original 32 rides are a reused benchmark. The 63 fresh complementary rides were entirely below 100 km and have also been inspected and influenced this operational correction. They do not establish long-distance or prospective forecast accuracy. Long-distance and issued-forecast reliability remain provisional."
     )
     st.info(
-        f"Earlier-selected candidate: {report['selected_method']}. Current default: {recommended}. {'Predeclared fresh-data gate passed.' if report['default_changed'] else 'Fresh-data gate did not support changing the default.'} Full-stop mode is a scenario; this validation used observed traffic and automatic HR."
+        f"Earlier development candidate: {report['selected_method']}. Original gate against {release.get('reference_comparator', 'CW-auto')}: {release.get('original_gate', {}).get('outcome', 'passed' if report['default_changed'] else 'failed')}. Current operational default: {recommended or 'unavailable'}. The gate outcome and operational correction are separate decisions. Full-stop mode is a scenario; validation used observed traffic and automatic HR."
     )
     st.subheader("Old and new models · same rides")
     comparison["Model"] = comparison.variant.map(LABELS)
@@ -63,9 +107,6 @@ def phase5_performance(report, store):
         "conservative_optimistic_errors",
     ]
     st.dataframe(comparison.reindex(columns=columns), hide_index=True, width="stretch")
-    st.caption(
-        f"Fresh paired MAPE difference versus C+Weather: {report['fresh_difference']['mape_difference_pp']:+.2f} percentage points; 95% circular-block bootstrap range {report['fresh_difference']['bootstrap_95_pp']}. This uncertainty does not account for all development choices."
-    )
     st.subheader("Error by distance")
     groups = pd.DataFrame(
         [{"Distance": band, **m} for band, m in report[key]["groups"][diagnostic].items()]
@@ -84,6 +125,15 @@ def phase5_performance(report, store):
         source = source[~source.id.isin(old_ids)]
     elif key == "reused":
         source = source[source.id.isin(old_ids)]
+    difference = paired_difference(source.to_dict("records"), diagnostic)
+    if difference.get("rides"):
+        st.caption(
+            f"{LABELS.get(diagnostic, diagnostic)} paired MAPE difference versus CW-auto in this cohort: {difference['mape_difference_pp']:+.2f} percentage points; 95% chronological block-bootstrap range {difference['bootstrap_95_pp']}. This is uncertainty in the historical comparison, not the selected model's route-specific finish interval."
+        )
+    if diagnostic == "bias-corrected":
+        st.caption(
+            "Bias correction remains an advanced alternative. Its fresh-cohort difference against CW-auto crossed zero; no parameters were retuned and it was not promoted by its lowest observed MAPE."
+        )
     selected = source[source.variant.eq(diagnostic)].copy()
     selected["Actual elapsed (h)"] = selected.actual_elapsed_s / 3600
     selected["Predicted elapsed (h)"] = selected.predicted_elapsed_s / 3600

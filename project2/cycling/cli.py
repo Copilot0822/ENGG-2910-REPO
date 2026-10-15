@@ -87,7 +87,8 @@ def main():
         "planning", help="Audit and train measured-HR, total duration and daylight planning"
     )
     planning.add_argument(
-        "action", choices=["audit", "train", "validate", "percentages", "report", "phase5"]
+        "action",
+        choices=["audit", "train", "validate", "percentages", "report", "phase5", "refresh-default"],
     )
     planning.add_argument("--archive", help="Optional original export for missing FIT timing metadata")
     planning.add_argument("--validation-rides", type=int)
@@ -186,6 +187,10 @@ def main():
                 settings.validation_rides = args.validation_rides
             if args.action == "audit":
                 summary = audit_history(store, settings, args.archive, progress)
+            elif args.action == "refresh-default":
+                from .release_policy import refresh_operational_default
+
+                summary = refresh_operational_default(store)["release_decision"]
             elif args.action == "phase5":
                 from .phase5_validation import evaluate_phase5
                 from .journey import fit_phase5
@@ -220,6 +225,7 @@ def main():
                     "hr_metrics": report.get("hr_metrics"),
                     "percentage_comparison_cohort": report.get("percentage_comparison_cohort"),
                     "percentage_ranking": report.get("percentage_ranking"),
+                    "operational_release": store.get_state("phase5_1_release"),
                 }
         elif args.command == "train":
             settings.optimize_half_life = args.optimize_half_life or settings.optimize_half_life
